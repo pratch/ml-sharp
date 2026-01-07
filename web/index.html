@@ -85,6 +85,11 @@
     <input type="range" id="amplitude-slider" min="0" max="0.2" step="0.001" value="0.06">
     <label for="frequency-slider">Frequency: <span id="frequency-value">0.001</span></label>
     <input type="range" id="frequency-slider" min="0.0001" max="0.01" step="0.0001" value="0.001">
+    <label for="camera-motion">Camera Motion:</label>
+    <select id="camera-motion">
+      <option value="None">None</option>
+      <option value="SpiralXY">SpiralXY</option>
+    </select>
   </div>
   <div id="container"></div>
   <button id="save-sbs" style="position:fixed;top:20px;right:20px;z-index:10;">Save Side-by-Side Image</button>
@@ -104,7 +109,7 @@
 
     // let width = 4000;
     // let height = 3000;
-    let width, height, ratio, vfov;
+    let width, height, ratio, vfov, median_depth;
 
     // Fetch width and height from JSON
     await fetch(jsonURL)
@@ -114,6 +119,7 @@
         height = meta.height;
         ratio = width / height;
         vfov = meta.vertical_fov_degrees;
+        median_depth = meta.median_depth;
       });
 
     let innerWidth = window.innerWidth;
@@ -147,7 +153,7 @@
     document.getElementById('container').appendChild(renderer.domElement)
 
     // --- OrbitControls ---
-    let center = new THREE.Vector3(0, 0, -5);
+    let center = new THREE.Vector3(0, 0, -median_depth);
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.rotateSpeed = 0.1;
     controls.target.copy(center);
@@ -221,14 +227,21 @@
     });
 
 
-    renderer.setAnimationLoop(function animate(time) {
-      // Animate camera x position in a sine wave
-      // camera.position.x = amplitude * Math.sin(time * frequency);
-      // camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
-      // camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);
+    const cameraMotionSelect = document.getElementById('camera-motion');
+    let cameraMotion = cameraMotionSelect.value;
+    cameraMotionSelect.addEventListener('change', (e) => {
+      cameraMotion = e.target.value;
+    });
 
-      // camera.lookAt(0, 0, -0.4);
-      // camera.lookAt(0, 0, -10);
+    renderer.setAnimationLoop(function animate(time) {
+      if (cameraMotion === "SpiralXY") {
+        camera.position.x = amplitude * Math.sin(time * frequency);
+        camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
+        camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);
+        controls.target.copy(center);
+        controls.update();
+      }
+      // If "none", do not animate camera position
       camera.lookAt(center);
       renderer.render(scene, camera);
       // butterfly.rotation.y += 0.01;

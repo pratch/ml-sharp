@@ -130,9 +130,9 @@ def predict_cli(
         output_ply_path = output_path / f"{image_path.stem}.ply"
         output_json_path = output_path / f"{image_path.stem}.json"
 
-        # if output_ply_path.exists() and output_json_path.exists():
-            # LOGGER.info("Skipping %s (already processed)", image_path)
-            # continue
+        if output_ply_path.exists() and output_json_path.exists():
+            LOGGER.info("Skipping %s (already processed)", image_path)
+            continue
 
         LOGGER.info("Processing %s", image_path)
         image, _, f_px = io.load_rgb(image_path)
@@ -157,7 +157,7 @@ def predict_cli(
         else:
             LOGGER.info("PLY file %s already exists, skipping.", output_ply_path)
 
-        if not output_json_path.exists() or True:
+        if not output_json_path.exists():
             # Compute vertical FOV in degrees
             vertical_fov_radians = 2 * np.arctan((height / 2) / f_px)
             vertical_fov_degrees = np.degrees(vertical_fov_radians)
