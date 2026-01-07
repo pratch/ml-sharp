@@ -87,8 +87,8 @@
     <input type="range" id="frequency-slider" min="0.0001" max="0.01" step="0.0001" value="0.001">
     <label for="camera-motion">Camera Motion:</label>
     <select id="camera-motion">
-      <option value="None">None</option>
-      <option value="SpiralXY">SpiralXY</option>
+      <option>None</option>
+      <option>SpiralXYZ</option>
     </select>
   </div>
   <div id="container"></div>
@@ -234,7 +234,7 @@
     });
 
     renderer.setAnimationLoop(function animate(time) {
-      if (cameraMotion === "SpiralXY") {
+      if (cameraMotion === "SpiralXYZ") {
         camera.position.x = amplitude * Math.sin(time * frequency);
         camera.position.y = 0.5 * amplitude * Math.sin(2 * time * frequency);
         camera.position.z = 4 * amplitude * Math.sin(0.5 * time * frequency);

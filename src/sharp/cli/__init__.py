@@ -6,7 +6,7 @@ Copyright (C) 2025 Apple Inc. All Rights Reserved.
 
 import click
 
-from . import predict, render, predict_with_info
+from . import predict, render, predict_with_info, dof_edit
 from .render_mask import render_mask_cli
 
 
@@ -21,4 +21,5 @@ main_cli.add_command(predict.predict_cli, "predict")
 main_cli.add_command(render.render_cli, "render")
 main_cli.add_command(render_mask_cli, "render-mask")
 main_cli.add_command(predict_with_info.predict_cli, "predict-with-info")
+main_cli.add_command(dof_edit.dof_edit_cli, "dof-edit")
 

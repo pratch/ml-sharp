@@ -18,7 +18,13 @@ app.get('/list', (req, res) => {
       res.status(500).send('Cannot read directory');
       return;
     }
+    // Sort json files by modified time, recent first
     const jsonFiles = files.filter(f => f.endsWith('.json'));
+    jsonFiles.sort((a, b) => {
+      const aTime = fs.statSync(path.join(dir, a)).mtimeMs;
+      const bTime = fs.statSync(path.join(dir, b)).mtimeMs;
+      return bTime - aTime;
+    });
     const items = jsonFiles.map(f => {
       const name = f.replace(/\.json$/, '');
       // read the content of the json file to get the image name
