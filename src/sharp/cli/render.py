@@ -48,7 +48,8 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
 
     output_path.mkdir(exist_ok=True, parents=True)
 
-    params = camera.TrajectoryParams()
+    # params = camera.TrajectoryParams(type="shake")
+    params = camera.TrajectoryParams(type="swipe")
 
     if input_path.suffix == ".ply":
         scene_paths = [input_path]
@@ -59,6 +60,7 @@ def render_cli(input_path: Path, output_path: Path, verbose: bool):
         exit(1)
 
     for scene_path in scene_paths:
+        if "135351" not in scene_path.stem: continue
         LOGGER.info("Rendering %s", scene_path)
         gaussians, metadata, _, _ = load_ply(scene_path)
         render_gaussians(

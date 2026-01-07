@@ -68,7 +68,7 @@ def compute_gaussian_input_visibility(
         (projected_x_int >= 0) & (projected_x_int < image_width) &
         (projected_y_int >= 0) & (projected_y_int < image_height)
     )
-    depth_match = torch.abs(projected_depths - input_depths_at_pixels) < depth_epsilon
+    depth_match = projected_depths < input_depths_at_pixels + depth_epsilon
     visible_in_input_view = is_projected_on_image & valid_depth_mask & depth_match
     return visible_in_input_view.cpu()
 
@@ -106,10 +106,16 @@ def render_mask_cli(input_path: Path, output_path: Path, verbose: bool):
         exit(1)
     device = torch.device("cuda")
     for scene_path in scene_paths:
-        # if "175229" not in scene_path.stem: continue
+        # if "103505" not in scene_path.stem: continue
+        if "131730" not in scene_path.stem: continue
         LOGGER.info("Rendering mask for %s", scene_path)
         gaussians_original, metadata, input_intrinsics, input_extrinsics = load_ply(scene_path)
         (width, height) = metadata.resolution_px
+        LOGGER.info(f"Focal length for {scene_path.name}: {metadata.focal_length_px:.2f}px")
+        LOGGER.info(f"Image resolution for {scene_path.name}: {width}x{height}px")
+        vertical_fov_radians = 2 * np.arctan((height / 2) / metadata.focal_length_px)
+        vertical_fov_degrees = np.degrees(vertical_fov_radians)
+        LOGGER.info(f"Vertical FOV for {scene_path.name}: {vertical_fov_degrees:.2f} degrees")
         renderer = gsplat.GSplatRenderer(color_space=metadata.color_space, background_color="black")
         visible_in_input_view = compute_gaussian_input_visibility(
             gaussians=gaussians_original,
@@ -119,7 +125,7 @@ def render_mask_cli(input_path: Path, output_path: Path, verbose: bool):
             image_height=height,
             renderer=renderer,
             device=device,
-            depth_epsilon=0.1,
+            depth_epsilon=10,
         )
         masked_opacities = gaussians_original.opacities * visible_in_input_view.float().unsqueeze(0)
         white_colors = torch.ones_like(gaussians_original.colors) * 0.99
