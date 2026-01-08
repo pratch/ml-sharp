@@ -1,4 +1,4 @@
-# Rule: tmux send -t 1 '!python' Enter Enter
+# Rule: tmux send -t 1 '!dpython' Enter Enter
 """Contains `sharp predict` CLI implementation.
 
 For licensing see accompanying LICENSE file.
@@ -98,34 +98,10 @@ def predict_cli(
             image_paths.extend(list(input_path.glob(f"**/*{ext}")))
 
     for image_path in image_paths:
-        if "441902" not in str(image_path):
+        # if "441902" not in str(image_path):
+        if "194034" not in str(image_path):
             continue
-        output_depth_path = output_path / f"{image_path.stem}.npy"
-        depth = np.load(output_depth_path)
-        print(depth.shape, depth.dtype, depth.min(), depth.max())
-
-        # find the seed from the nearest point
-        seed_point = np.unravel_index(np.nanargmin(depth[0]), depth[0].shape)
-        seed_point = (seed_point[1], seed_point[0])  # (col, row) for OpenCV
-
-        print("seed_point:", seed_point)
-
-        flooded_depth, mask = flood_fill(depth[0], seed_point=seed_point, max_diff=0.01)
-        # output_mask_path = output_path / f"{image_path.stem}_mask.png"
-        # save_depth(flooded_depth, output_mask_path)
-        #
-        # output_mask_path = output_path / f"{image_path.stem}_depth0.png"
-        # save_depth(depth[0], output_mask_path)
-
-        # dilate mask by 5
-        kernel = np.ones((3, 3), np.uint8)
-        # mask = cv.dilate(mask, kernel, iterations=5)
-
-        # erode mask by 10
-        mask = cv.erode(mask, kernel, iterations=5)
-        mask = mask[1:-1, 1:-1]  # remove the border
-
-        cv.imwrite(output_path / f"{image_path.stem}_mask2.png", mask * 255)  # remove the border
+        # output_depth_path = output_path / f"{image_path.stem}.npy"
 
         gaussians, metadata, _, _ = load_ply(output_path / f"{image_path.stem}.ply")
         width, height = metadata.resolution_px
@@ -154,6 +130,29 @@ def predict_cli(
             image_width=width,
             image_height=height,
         )
+
+        # depth = np.load(output_depth_path)
+        depth = rendering_output.depth[0].cpu().numpy()
+        print(depth.shape, depth.dtype, depth.min(), depth.max())
+
+        # find the seed from the nearest point
+        seed_point = np.unravel_index(np.nanargmin(depth[0]), depth[0].shape)
+        seed_point = (seed_point[1], seed_point[0])  # (col, row) for OpenCV
+
+        print("seed_point:", seed_point)
+
+        flooded_depth, mask = flood_fill(depth[0], seed_point=seed_point, max_diff=0.01)
+
+        kernel = np.ones((3, 3), np.uint8)
+        # mask = cv.dilate(mask, kernel, iterations=5)
+
+        # erode mask by 10
+        mask = cv.erode(mask, kernel, iterations=5)
+        mask = mask[1:-1, 1:-1]  # remove the border
+
+        cv.imwrite(output_path / f"{image_path.stem}_mask2.png", mask * 255)  # remove the border
+
+
         color = (rendering_output.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
         color = color.cpu().numpy()
 

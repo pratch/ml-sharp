@@ -97,6 +97,7 @@
     let jsonURL = `../output2/${file}.json`;
 
     let ui = getQueryParam('ui') || "true";
+    let hybrid = getQueryParam('hybrid') || "false";
 
     // let width = 4000;
     // let height = 3000;
@@ -217,7 +218,14 @@
 
 
 
-    const splat = new SplatMesh({url: plyURL.replace(".ply", "_pruned.ply")});
+    let splatURL = plyURL, meshURL = plyURL;
+    if (hybrid === "true") {
+      splatURL = splatURL.replace(".ply", "_pruned.ply");
+      meshURL = meshURL.replace(".ply", "_mesh.ply");
+    }
+
+    const splat = new SplatMesh({url: splatURL});
+    
     // const splat = new SplatMesh({url: plyURL});
     splat.quaternion.set(1, 0, 0, 0);
     splat.position.set(0, 0, 0);
@@ -234,20 +242,22 @@
       showMesh: true,
       showSplat: true
     };
-
     splat.visible = guiParams.showSplat;
-    loader.load(plyURL.replace(".ply", "_mesh.ply"), function (geometry) {
-      geometry.computeVertexNormals();
-      // If your PLY has vertex colors, use vertexColors: true
-      const material = new THREE.MeshBasicMaterial({ vertexColors: true });
-      const mesh = new THREE.Mesh(geometry, material);
-      mesh.quaternion.set(1, 0, 0, 0);
-      mesh.position.set(0, 0, 0);
-      mesh.visible = guiParams.showMesh;
-      scene.add(mesh);
-      meshObj = mesh;
-      // alert("added");
-    });
+
+    if (hybrid == "true") {
+      loader.load(meshURL, function (geometry) {
+        geometry.computeVertexNormals();
+        // If your PLY has vertex colors, use vertexColors: true
+        const material = new THREE.MeshBasicMaterial({ vertexColors: true });
+        const mesh = new THREE.Mesh(geometry, material);
+        mesh.quaternion.set(1, 0, 0, 0);
+        mesh.position.set(0, 0, 0);
+        mesh.visible = guiParams.showMesh;
+        scene.add(mesh);
+        meshObj = mesh;
+        // alert("added");
+      });
+    }
 
     const gui = new dat.GUI();
     gui.add(guiParams, 'cameraMotion', ["None", "SpiralXYZ", "SpiralXY"]);
