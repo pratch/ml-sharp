@@ -52,7 +52,6 @@ app.get('/list', (req, res) => {
         </div>
       `;
             // <div class="scene-filename">${f}</div>
-        //
     }).join('\n');
     // Read the template and inject the items
     const templatePath = path.join(__dirname, 'web', 'list.html');
@@ -111,6 +110,37 @@ app.post('/upload', upload.array('files[]'), async (req, res) => {
     console.error('Error processing files:', error);
     res.status(500).send('Error processing files');
   }
+});
+
+// Delete scene and associated files
+app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
+  const scene = req.body.scene;
+  if (!scene) return res.status(400).send('No scene specified');
+
+  // Delete image from /images
+  const outputDir = path.join(__dirname, 'output2');
+  let imageName = '';
+  try {
+    const jsonPath = path.join(outputDir, scene + '.json');
+    if (fs.existsSync(jsonPath)) {
+      const jsonData = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      imageName = jsonData.image || '';
+      if (imageName) {
+        const imgPath = path.join(__dirname, 'images', imageName);
+        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+      }
+    }
+  } catch (e) {}
+
+  // Delete all files in output2/ with the same base name
+  const files = fs.readdirSync(outputDir);
+  files.forEach(f => {
+    if (f.startsWith(scene + '.')) {
+      fs.unlinkSync(path.join(outputDir, f));
+    }
+  });
+
+  res.send({ success: true });
 });
 
 // 404 handler for other routes

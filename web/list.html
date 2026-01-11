@@ -36,6 +36,11 @@
       background: #23272e;
       border-radius: 12px;
       box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
+      transition: background 0.3s;
+    }
+    .scene-item.deletable {
+      background: #990000 !important;
+      box-shadow: 0 2px 12px rgba(255, 0, 0, 0.10);
     }
 
     .scene-item a {
@@ -136,7 +141,7 @@
       cursor: pointer;
     }
 
-    #browse_file {
+     #browse_file {
       background-color: #0066cc;
       border: none;
       color: white;
@@ -146,6 +151,56 @@
       cursor: pointer;
       border-radius: 4px;
       font-size: 18px;
+    }
+    /* Toggle Switch Styles */
+    .toggle-switch {
+      position: relative;
+      display: inline-block;
+      width: 60px;
+      height: 32px;
+      margin: 8px;
+      vertical-align: middle;
+    }
+    .toggle-switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background-color: #ccc;
+      transition: .4s;
+      border-radius: 32px;
+    }
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 24px;
+      width: 24px;
+      left: 4px;
+      bottom: 4px;
+      background-color: white;
+      transition: .4s;
+      border-radius: 50%;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.18);
+    }
+    .toggle-switch input:checked + .slider {
+      background-color: #ff4e50;
+    }
+    .toggle-switch input:checked + .slider:before {
+      transform: translateX(28px);
+    }
+    .toggle-label {
+      margin-left: 12px;
+      font-size: 18px;
+      color: #eee;
+      vertical-align: middle;
+      user-select: none;
     }
   </style>
 </head>
@@ -160,6 +215,11 @@
 
   <input type="file" id="fileInput" multiple style="display: none;" />
   <button id="browse_file" onclick="$('#fileInput').click();">Select Files</button>
+  <label class="toggle-switch">
+    <input type="checkbox" id="toggleDelete">
+    <span class="slider"></span>
+  </label>
+  <span class="toggle-label" id="toggleDeleteLabel">Delete: Off</span>
   <div id="progressContainer" style="display:none;">
     <div id="progressBar">0%</div>
   </div>
@@ -211,6 +271,31 @@
     }
 
     $(document).ready(function () {
+      // Toggle delete switch
+      $('#toggleDelete').on('change', function() {
+        if ($(this).is(':checked')) {
+          $('#toggleDeleteLabel').text('Delete: On');
+          $('.scene-item').addClass('deletable');
+        } else {
+          $('#toggleDeleteLabel').text('Delete: Off');
+          $('.scene-item').removeClass('deletable');
+        }
+      });
+
+      // Click to delete when delete mode is on
+      $(document).on('click', '.scene-item.deletable', function(e) {
+        e.preventDefault();
+        const sceneName = $(this).find('a').attr('href').match(/scene=([^&]+)/);
+        if (!sceneName) return;
+        const name = decodeURIComponent(sceneName[1]);
+        if (!confirm('Delete "' + name + '"?')) return;
+        const $item = $(this);
+        $.post('/delete', { scene: name }, function(response) {
+          if (response && response.success) {
+            $item.fadeOut(300, function() { $(this).remove(); });
+          }
+        });
+      });
       // Setup drag and drop
       $(window).on('dragenter', function (e) {
         e.preventDefault();
