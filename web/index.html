@@ -75,6 +75,7 @@
     }
   }
 </script>
+<script src="https://cdn.jsdelivr.net/npm/stats-js@1.0.1/build/stats.min.js"></script>
 </head>
 
 <body>
@@ -86,7 +87,12 @@
     import {SplatMesh} from "@sparkjsdev/spark";
     import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+    import { GLTFLoader } from 'https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js';
   
+    const stats = new Stats();
+    stats.showPanel(0); // 0: fps, 1: ms, 2: mb, 3+: custom
+    document.body.appendChild(stats.dom);
+
     // Get scene from URL (?scene=...) or use default
     function getQueryParam(name) {
       const params = new URLSearchParams(window.location.search);
@@ -154,20 +160,24 @@
 
     // let median_depth = meta.median_depth;
     let median_depth = 1 / linspace[50];
+    let center_depth = median_depth;
 
-    let center = new THREE.Vector3(0, 0, -median_depth);
+    let center = new THREE.Vector3(0, 0, -center_depth);
     const controls = new OrbitControls(camera, renderer.domElement);
 
 
     console.log("median depth:", median_depth);
     const angle = 20;
-    const kz = median_depth + (meta.percentile_1_depth - median_depth) * Math.cos(angle * Math.PI / 180);
-    const ky = (meta.percentile_1_depth - median_depth) * Math.sin(angle * Math.PI / 180);
+    const distance = meta.percentile_99_depth - meta.percentile_1_depth
+    const kz = meta.percentile_99_depth - distance * Math.cos(angle * Math.PI / 180);
+    const ky = distance * Math.sin(angle * Math.PI / 180);
 
     const cc = meta.focal_length_px * ky / kz;
+    console.log("perc 1 depth:", meta.percentile_1_depth);
+    console.log("perc 99 depth:", meta.percentile_99_depth);
     console.log(cc);
 
-    controls.rotateSpeed = 0.2 * -529 / cc;
+    controls.rotateSpeed = 800 / cc;
     controls.target.copy(center);
     controls.enablePan = true;
     controls.update();
@@ -221,7 +231,8 @@
     let splatURL = plyURL, meshURL = plyURL;
     if (hybrid === "true") {
       splatURL = splatURL.replace(".ply", "_pruned.ply");
-      meshURL = meshURL.replace(".ply", "_mesh.ply");
+      // meshURL = meshURL.replace(".ply", "_mesh.ply");
+      meshURL = meshURL.replace(".ply", "_mesh.glb");
     }
 
     const splat = new SplatMesh({url: splatURL});
@@ -231,7 +242,6 @@
     splat.position.set(0, 0, 0);
     scene.add(splat);
 
-    const loader = new PLYLoader();
     let meshObj = null;
 
     let guiParams = {
@@ -245,6 +255,8 @@
     splat.visible = guiParams.showSplat;
 
     if (hybrid == "true") {
+      /*
+      const loader = new PLYLoader();
       loader.load(meshURL, function (geometry) {
         geometry.computeVertexNormals();
         // If your PLY has vertex colors, use vertexColors: true
@@ -257,6 +269,37 @@
         meshObj = mesh;
         // alert("added");
       });
+      */
+      const loader = new GLTFLoader();
+      loader.load(meshURL, function (gltf) {
+        const model = gltf.scene;
+        model.quaternion.set(1, 0, 0, 0);
+        model.position.set(0, 0, 0);
+        model.visible = guiParams.showMesh;
+        scene.add(model);
+        meshObj = model;
+
+
+        model.traverse((child) => {
+          if (child.isMesh) {
+              // Grab the original PBR material created by the loader
+              const originalMaterial = child.material;
+
+              child.material = new THREE.MeshBasicMaterial({
+                  map: originalMaterial.map, // This is your UV texture
+                  side: THREE.DoubleSide,    // Ensures both sides of faces are visible
+              });
+
+              if (child.material.map) {
+                  child.material.map.colorSpace = THREE.SRGBColorSpace;
+              }
+          }
+        });
+
+
+      });
+      scene.add(new THREE.AmbientLight(0xffffff, 1.0)); // Full ambient, no shadows
+
     }
 
     const gui = new dat.GUI();
@@ -264,7 +307,8 @@
     gui.add(guiParams, 'amplitude', 0, 10, 0.1);
     gui.add(guiParams, 'speed', 0.1, 5, 0.1);
     gui.add(guiParams, 'center', 0, 99, 1).onChange((value) => {
-      let new_center = new THREE.Vector3(0, 0, -1/linspace[Math.floor(value)]);
+      center_depth = 1/linspace[Math.floor(value)];
+      let new_center = new THREE.Vector3(0, 0, -center_depth);
       controls.target.copy(new_center);
       controls.update();
     });
@@ -274,6 +318,9 @@
     gui.add(guiParams, 'showSplat').onChange((value) => {
       if (splat) splat.visible = value;
     });
+    if (ui === "false") {
+      gui.hide();
+    }
 
     window.addEventListener('keydown', (e) => {
       if (e.code === 'Space') {
@@ -282,13 +329,15 @@
           gui.updateDisplay();
         } else {
           camera.position.set(0, 0, 0);
-          camera.lookAt(0, 0, -median_depth);
+          center_depth = median_depth;
+          camera.lookAt(0, 0, -center_depth);
         }
       }
     });
 
     renderer.setAnimationLoop(function animate(time) {
-      let amplitude = guiParams.amplitude * 0.01;
+      stats.begin();
+      let amplitude = guiParams.amplitude * 0.005 * distance;
       let speed = guiParams.speed * 0.001;
       let cameraMotion = guiParams.cameraMotion;
       if (cameraMotion === "SpiralXYZ") {
@@ -302,6 +351,7 @@
       controls.update();
       renderer.render(scene, camera);
       // splat.rotation.y += 0.01;
+      stats.end();
     });
   </script>
 

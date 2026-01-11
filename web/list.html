@@ -1,10 +1,25 @@
 <!DOCTYPE html>
 <html>
+
 <head>
   <title>Scene List</title>
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"
+    integrity="sha256-/JqT3SQfawRcv/BIHPThkBvs0OEvtFFmqPF/lYI/Cxo=" crossorigin="anonymous"></script>
+
   <style>
-    body { font-family: 'Segoe UI', Arial, sans-serif; background: #181c20; color: #eee; margin: 0; padding: 0; }
-    h1 { text-align: center; margin-top: 24px; }
+    body {
+      font-family: 'Segoe UI', Arial, sans-serif;
+      background: #181c20;
+      color: #eee;
+      margin: 0;
+      padding: 5px;
+    }
+
+    h1 {
+      text-align: center;
+      margin-top: 24px;
+    }
+
     .scene-grid {
       display: flex;
       flex-wrap: wrap;
@@ -15,12 +30,14 @@
       width: 100%;
       margin: 0 auto;
     }
+
     .scene-item {
       width: 250px;
       background: #23272e;
       border-radius: 12px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+      box-shadow: 0 2px 12px rgba(0, 0, 0, 0.18);
     }
+
     .scene-item a {
       padding: 5px;
       display: flex;
@@ -31,10 +48,12 @@
       justify-content: space-between;
       height: 100%;
     }
+
     .scene-item:hover {
       transform: translateY(-6px) scale(1.04);
-      box-shadow: 0 6px 24px rgba(0,0,0,0.28);
+      box-shadow: 0 6px 24px rgba(0, 0, 0, 0.28);
     }
+
     .scene-item img {
       width: 100%;
       /* max-width: 160px; */
@@ -42,10 +61,11 @@
       border-radius: 8px;
       margin-bottom: 10px;
       background: #111;
-      box-shadow: 0 1px 6px rgba(0,0,0,0.12);
+      box-shadow: 0 1px 6px rgba(0, 0, 0, 0.12);
       display: block;
       object-fit: contain;
     }
+
     .scene-filename {
       margin-top: 4px;
       font-size: 1em;
@@ -53,12 +73,186 @@
       text-align: center;
       word-break: break-all;
     }
-    a { text-decoration: none; color: inherit; }
+
+    a {
+      text-decoration: none;
+      color: inherit;
+    }
+
+
+    #dropOverlay {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      background: rgba(34, 34, 34, 0.85);
+      z-index: 9999;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #dropOverlayText {
+      color: #4CAF50;
+      font-size: 2em;
+      background: rgba(0, 0, 0, 0.2);
+      padding: 40px 80px;
+      border-radius: 16px;
+      border: 2px dashed #4CAF50;
+    }
+
+    #progressBar {
+      width: 0%;
+      height: 20px;
+      background-color: #4CAF50;
+      text-align: center;
+      line-height: 20px;
+      color: white;
+    }
+
+    #progressContainer {
+      width: 100%;
+      background-color: #ddd;
+    }
+
+
+    input[type=text] {
+      width: 50%;
+      padding: 12px 20px;
+      margin: 8px 0;
+      box-sizing: border-box;
+    }
+
+    input[type=button],
+    input[type=submit],
+    input[type=reset] {
+      background-color: #04AA6D;
+      border: none;
+      color: white;
+      padding: 16px 32px;
+      text-decoration: none;
+      margin: 4px 2px;
+      cursor: pointer;
+    }
+
+    #browse_file {
+      background-color: #0066cc;
+      border: none;
+      color: white;
+      padding: 12px 12px;
+      text-decoration: none;
+      margin: 8px;
+      cursor: pointer;
+      border-radius: 4px;
+      font-size: 18px;
+    }
   </style>
 </head>
+
 <body>
+  <!-- <input type="text" id="urlupload"><input type="button" value="Upload" -->
+  <!-- onclick="uploadUrl([document.getElementById('urlupload').value]);"> -->
+
+  <div id="dropOverlay" style="display:none;">
+    <div id="dropOverlayText">Drop files here</div>
+  </div>
+
+  <input type="file" id="fileInput" multiple style="display: none;" />
+  <button id="browse_file" onclick="$('#fileInput').click();">Select Files</button>
+  <div id="progressContainer" style="display:none;">
+    <div id="progressBar">0%</div>
+  </div>
+
   <div class="scene-grid">
     <!-- SCENE_ITEMS_PLACEHOLDER -->
   </div>
+  <script>
+    function uploadFiles(files) {
+      let formData = new FormData();
+      for (let i = 0; i < files.length; i++) {
+        formData.append('files[]', files[i]);
+      }
+
+      $.ajax({
+        url: 'upload',
+        type: 'POST',
+        data: formData,
+        contentType: false,
+        processData: false,
+        xhr: function () {
+          var myXhr = $.ajaxSettings.xhr();
+          if (myXhr.upload) {
+            myXhr.upload.addEventListener('progress', function (e) {
+              if (e.lengthComputable) {
+                var percentComplete = e.loaded / e.total * 100;
+                $('#progressBar').width(percentComplete + '%');
+                $('#progressBar').text(Math.round(percentComplete) + '%');
+              }
+            }, false);
+          }
+          return myXhr;
+        },
+        beforeSend: function () {
+          $('#progressContainer').show();
+          $('#progressBar').width('0%');
+          $('#progressBar').text('0%');
+        },
+        success: function (data) {
+          console.log(data);
+          $('#progressContainer').hide();
+          <!-- listFiles(); // Refresh the file list after upload -->
+        },
+        error: function () {
+          $('#progressContainer').hide();
+          alert("Error uploading files");
+        }
+      });
+    }
+
+    $(document).ready(function () {
+      // Setup drag and drop
+      $(window).on('dragenter', function (e) {
+        e.preventDefault();
+        $('#dropOverlay').show();
+        clearTimeout(dragTimeout);
+      });
+
+      $(window).on('dragover', function (e) {
+        e.preventDefault();
+        clearTimeout(dragTimeout);
+        dragTimeout = setTimeout(function () {
+          $('#dropOverlay').hide();
+        }, 100); // Hide if drag leaves window
+      });
+
+      $(window).on('dragleave', function (e) {
+        e.preventDefault();
+        dragTimeout = setTimeout(function () {
+          $('#dropOverlay').hide();
+        }, 100);
+      });
+
+      $('#dropOverlay').on('drop', function (e) {
+        e.preventDefault();
+        e.stopPropagation();
+        $('#dropOverlay').hide();
+        let files = e.originalEvent.dataTransfer.files;
+        uploadFiles(files);
+      });
+
+      $('#dropOverlay').on('dragover', function (e) {
+        e.preventDefault();
+      });
+
+      // Handle file selection
+      $('#fileInput').change(function () {
+        let files = this.files;
+        uploadFiles(files);
+      });
+    });
+  </script>
+
 </body>
+
 </html>
