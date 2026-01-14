@@ -61,6 +61,39 @@ app.get('/list', (req, res) => {
   });
 });
 
+// API endpoint to get list of available scenes with required files
+app.get('/api/scenes', (req, res) => {
+  const dir = path.join(__dirname, 'output');
+  fs.readdir(dir, (err, files) => {
+    if (err) {
+      res.status(500).json({ error: 'Cannot read directory' });
+      return;
+    }
+    
+    // Find all .json files and check if corresponding .ply exists
+    const jsonFiles = files.filter(f => f.endsWith('.json'));
+    const scenes = [];
+    
+    for (const jsonFile of jsonFiles) {
+      const name = jsonFile.replace(/\.json$/, '');
+      const plyFile = name + '.ply';
+      
+      // Check if .ply file exists
+      if (files.includes(plyFile)) {
+        scenes.push(name);
+      }
+    }
+    
+    // Sort by modified time, recent first
+    scenes.sort((a, b) => {
+      const aTime = fs.statSync(path.join(dir, a + '.json')).mtimeMs;
+      const bTime = fs.statSync(path.join(dir, b + '.json')).mtimeMs;
+      return bTime - aTime;
+    });
+    
+    res.json({ scenes });
+  });
+});
 
 // Optionally serve static files from 'web' directory
 app.use('/output', express.static(path.join(__dirname, 'output')));

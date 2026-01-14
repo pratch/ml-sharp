@@ -98,7 +98,18 @@
       const params = new URLSearchParams(window.location.search);
       return params.get(name);
     }
-    let file = getQueryParam('scene') || "cornell";
+    
+    // Fetch available scenes from server
+    let availableScenes = [];
+    try {
+      const response = await fetch('../api/scenes');
+      const data = await response.json();
+      availableScenes = data.scenes || [];
+    } catch (error) {
+      console.error('Failed to fetch available scenes:', error);
+    }
+    
+    let file = getQueryParam('scene') || (availableScenes.length > 0 ? availableScenes[0] : "cornell");
     let plyURL = `../output/${file}.ply`;
     let jsonURL = `../output/${file}.json`;
 
@@ -245,6 +256,7 @@
     let meshObj = null;
 
     let guiParams = {
+      scene: file,
       cameraMotion: "None",
       amplitude: 2,
       speed: 1,
@@ -303,6 +315,17 @@
     }
 
     const gui = new dat.GUI();
+    
+    // Add scene picker if available scenes were loaded
+    if (availableScenes.length > 0) {
+      gui.add(guiParams, 'scene', availableScenes).name('Scene').onChange((value) => {
+        // Reload page with new scene parameter
+        const params = new URLSearchParams(window.location.search);
+        params.set('scene', value);
+        window.location.search = params.toString();
+      });
+    }
+    
     gui.add(guiParams, 'cameraMotion', ["None", "SpiralXYZ", "SpiralXY"]);
     gui.add(guiParams, 'amplitude', 0, 10, 0.1);
     gui.add(guiParams, 'speed', 0.1, 5, 0.1);
