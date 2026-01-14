@@ -104,6 +104,15 @@ def predict_cli(
         #     continue
         # output_depth_path = output_path / f"{image_path.stem}.npy"
 
+        # Check if mesh outputs already exist
+        mesh_output_path = output_path / f"{image_path.stem}_mesh.ply"
+        mesh_pruned_output_path = output_path / f"{image_path.stem}_pruned.ply"
+        glb_output_path = output_path / f"{image_path.stem}_mesh.glb"
+        
+        if mesh_output_path.exists() and mesh_pruned_output_path.exists():
+            LOGGER.info("Mesh files for %s already exist, skipping.", image_path.stem)
+            continue
+
         gaussians, metadata, _, _ = load_ply(output_path / f"{image_path.stem}.ply")
         width, height = metadata.resolution_px
         f_px = metadata.focal_length_px
@@ -257,8 +266,6 @@ def predict_cli(
             continue
 
         # 3. Save the mesh as a PLY file
-        mesh_output_path = output_path / f"{image_path.stem}_mesh.ply"
-
         with open(mesh_output_path, "w") as f:
             f.write("ply\n")
             f.write("format ascii 1.0\n")
@@ -335,7 +342,6 @@ def predict_cli(
                 visual=visual,
                 process=False
             )
-            glb_output_path = output_path / f"{image_path.stem}_mesh.glb"
             dec_mesh.export(glb_output_path)
             LOGGER.info(f"Decimated mesh with texture saved as GLB to {glb_output_path}")
         except ImportError:
@@ -395,7 +401,6 @@ def predict_cli(
             colors=gaussians.colors[0][flag][None],
             opacities=gaussians.opacities[0][flag][None],
         )
-        mesh_pruned_output_path = output_path / f"{image_path.stem}_pruned.ply"
         save_ply(new_gaussians, f_px, (height, width), mesh_pruned_output_path)
 
         LOGGER.info(f"Filtered Gaussians: {len(gaussian_means_3d) - len(new_gaussians)} removed. {len(new_gaussians)} remaining.")

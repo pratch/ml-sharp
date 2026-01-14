@@ -152,7 +152,7 @@ class MyEventHandler(FileSystemEventHandler):
             else:
                 LOGGER.info("Info file %s already exists, skipping.", output_json_path)
 
-            if not output_depth_path.exists() and False:
+            if not output_depth_path.exists():
                 if gaussians is None:
                     gaussians, metadata, _, _ = load_ply(output_ply_path)
                 else:
@@ -160,8 +160,8 @@ class MyEventHandler(FileSystemEventHandler):
 
                 renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
                 rendering_output = renderer(
-                    gaussians.to(device),
-                    extrinsics=torch.eye(4, device=device).unsqueeze(0),
+                    gaussians.to(self.device),
+                    extrinsics=torch.eye(4, device=self.device).unsqueeze(0),
                     intrinsics=intrinsics.unsqueeze(0),
                     image_width=width,
                     image_height=height,
@@ -188,7 +188,7 @@ class MyEventHandler(FileSystemEventHandler):
                     min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
                 )
                 colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
-                io.save_image(colored_depth_np, output_path / f"{image_path.stem}_color.png")
+                io.save_image(colored_depth_np, self.output_path / f"{image_path.stem}_color.png")
 
 
             else:
