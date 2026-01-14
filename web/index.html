@@ -92,12 +92,12 @@
       const params = new URLSearchParams(window.location.search);
       return params.get(name);
     }
-    let file = getQueryParam('scene') || "20251023_155037";
-    let plyURL = `../output2/${file}.ply`;
-    let jsonURL = `../output2/${file}.json`;
+    let file = getQueryParam('scene') || "cornell";
+    let plyURL = `../output/${file}.ply`;
+    let jsonURL = `../output/${file}.json`;
 
     let ui = getQueryParam('ui') || "true";
-    let hybrid = getQueryParam('hybrid') || "false";
+    let hybrid = getQueryParam('hybrid') || "true";
 
     // let width = 4000;
     // let height = 3000;

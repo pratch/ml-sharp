@@ -99,8 +99,8 @@ def predict_cli(
 
     for image_path in image_paths:
         # if "441902" not in str(image_path):
-        if "194034" not in str(image_path):
-            continue
+        # if "aomlion1" not in str(image_path):
+        #     continue
         # output_depth_path = output_path / f"{image_path.stem}.npy"
 
         gaussians, metadata, _, _ = load_ply(output_path / f"{image_path.stem}.ply")

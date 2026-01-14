@@ -58,7 +58,7 @@ DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh
     "-c",
     "--checkpoint-path",
     type=click.Path(path_type=Path, dir_okay=False),
-    default="sharp_2572gikvuh.pt",
+    default=None,
     help="Path to the .pt checkpoint. If not provided, downloads the default model automatically.",
     required=False,
 )
@@ -128,8 +128,8 @@ def predict_cli(
     output_path.mkdir(exist_ok=True, parents=True)
 
     for image_path in image_paths:
-        if "441902" not in str(image_path):
-            continue
+        # if "aomlion1" not in str(image_path):
+        #     continue
         output_ply_path = output_path / f"{image_path.stem}.ply"
         output_json_path = output_path / f"{image_path.stem}.json"
         output_depth_path = output_path / f"{image_path.stem}.npy"

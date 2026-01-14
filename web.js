@@ -12,7 +12,7 @@ app.get('/', (req, res) => {
 // List all .json files in output2 as links
 const fs = require('fs');
 app.get('/list', (req, res) => {
-  const dir = path.join(__dirname, 'output2');
+  const dir = path.join(__dirname, 'output');
   // get "ui" get parameter
   const ui = req.query.ui || 'true';
 
@@ -60,7 +60,7 @@ app.get('/list', (req, res) => {
 
 
 // Optionally serve static files from 'web' directory
-app.use('/output2', express.static(path.join(__dirname, 'output2')));
+app.use('/output', express.static(path.join(__dirname, 'output')));
 
 // Optionally serve static files from 'web' directory
 app.use('/images', express.static(path.join(__dirname, 'images')));
