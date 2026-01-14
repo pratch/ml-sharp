@@ -1,8 +1,11 @@
 const express = require('express');
+const multer = require('multer');
 const path = require('path');
 
 const app = express();
 const PORT = 3000;
+const imgdir = 'images';
+
 
 // Serve index.html at root
 app.get('/', (req, res) => {
@@ -45,10 +48,10 @@ app.get('/list', (req, res) => {
         <div class="scene-item">
           <a href='/?scene=${encodeURIComponent(name)}&ui=${ui}'>
             <img src='${imgSrc}' alt='${name}' />
-            <div class="scene-filename">${f}</div>
           </a>
         </div>
       `;
+            // <div class="scene-filename">${f}</div>
     }).join('\n');
     // Read the template and inject the items
     const templatePath = path.join(__dirname, 'web', 'list.html');
@@ -65,10 +68,86 @@ app.use('/output', express.static(path.join(__dirname, 'output')));
 // Optionally serve static files from 'web' directory
 app.use('/images', express.static(path.join(__dirname, 'images')));
 
+const storage = multer.diskStorage({
+  destination: function(req, file, cb) {
+    cb(null, path.join(__dirname, imgdir));
+  },
+  filename: function(req, file, cb) {
+    let base = path.basename(file.originalname, path.extname(file.originalname));
+
+    // const randomName = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    const randomName = Math.round(Math.random() * 1E5);
+    let finalName = base + '_' + randomName + path.extname(file.originalname).toLowerCase();
+
+    cb(null, finalName);
+  }
+});
+
+const upload = multer({ storage: storage });
+app.post('/upload', upload.array('files[]'), async (req, res) => {
+  try {
+    await Promise.all(req.files.map(async (file) => {
+      const ext = path.extname(file.originalname).toLowerCase();
+
+      if (ext === '.jpg' || ext === '.jpeg' || ext === '.png' || ext === '.webp') {
+              // const newFileName = file.path.replace(/\.[^/.]+$/, '_resized.jpg');
+        // console.log("change from ", file.path, " to ", newFileName);
+        // await sharp(file.path).rotate().resize({ height: 1400 }).toFile(newFileName);
+        // fs.unlinkSync(file.path); // Delete original file
+
+        // no resize anymore, just rotate with exif
+        console.log("process image ", file.path);
+        // fs.unlinkSync(file.path);
+        // const newFileName = file.path.replace(/\.[^/.]+$/, '_tmp.jpg');
+        // await sharp(file.path).rotate().resize({ height: 1400 }).toFile(newFileName);
+        // fs.unlinkSync(file.path); // Delete original file
+        // fs.renameSync(newFileName, file.path);
+      }
+    }));
+
+    res.send('Files uploaded and processed successfully.');
+  } catch (error) {
+    console.error('Error processing files:', error);
+    res.status(500).send('Error processing files');
+  }
+});
+
+// Delete scene and associated files
+app.post('/delete', express.urlencoded({ extended: true }), (req, res) => {
+  const scene = req.body.scene;
+  if (!scene) return res.status(400).send('No scene specified');
+
+  // Delete image from /images
+  const outputDir = path.join(__dirname, 'output2');
+  let imageName = '';
+  try {
+    const jsonPath = path.join(outputDir, scene + '.json');
+    if (fs.existsSync(jsonPath)) {
+      const jsonData = JSON.parse(fs.readFileSync(jsonPath, 'utf8'));
+      imageName = jsonData.image || '';
+      if (imageName) {
+        const imgPath = path.join(__dirname, 'images', imageName);
+        if (fs.existsSync(imgPath)) fs.unlinkSync(imgPath);
+      }
+    }
+  } catch (e) {}
+
+  // Delete all files in output2/ with the same base name
+  const files = fs.readdirSync(outputDir);
+  files.forEach(f => {
+    if (f.startsWith(scene + '.')) {
+      fs.unlinkSync(path.join(outputDir, f));
+    }
+  });
+
+  res.send({ success: true });
+});
+
 // 404 handler for other routes
 app.use((req, res) => {
   res.status(404).send('404 Not Found');
 });
+
 
 app.listen(PORT, () => {
   console.log(`Express server running at http://localhost:${PORT}/`);

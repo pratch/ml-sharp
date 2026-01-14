@@ -35,6 +35,7 @@ from sharp.utils.gaussians import (
 
 from sharp.cli.render import render_gaussians
 import cv2 as cv
+from PIL import Image
 
 LOGGER = logging.getLogger(__name__)
 
@@ -284,6 +285,64 @@ def predict_cli(
                 f.write(f"3 {' '.join(map(str, face))}\n")
 
         LOGGER.info(f"Mesh with {len(vertices_np)} vertices and {len(faces)} faces saved to {mesh_output_path}")
+
+        # 3b. Save the mesh as a GLB (glTF binary) file using trimesh
+        try:
+            import trimesh
+            import pyvista as pv
+            pv_mesh = pv.PolyData(vertices_np, np.hstack((np.full((len(faces), 1), 3, dtype=np.int64), np.array(faces, dtype=np.int64))).astype(np.int64))
+            target_reduction = 0.99
+            decimated = pv_mesh.decimate_pro(target_reduction, preserve_topology=True, boundary_vertex_deletion=True)
+            # Convert back to trimesh
+
+            dec_vertices = decimated.points.astype(np.float32)
+            dec_faces = decimated.faces.reshape(-1, 4)[:, 1:4]
+
+            # Map colors if possible, else use mean color
+            if hasattr(decimated, 'point_arrays') and 'RGB' in decimated.point_arrays:
+                dec_colors = decimated.point_arrays['RGB'].astype(np.uint8)
+            else:
+                mean_color = vertex_colors_np.mean(axis=0).astype(np.uint8)
+                dec_colors = np.tile(mean_color, (dec_vertices.shape[0], 1))
+
+            # --- Texture and UV generation ---
+            # Save the color image as a PNG texture
+            texture_path = output_path / f"{image_path.stem}_texture.png"
+            io.save_image(color, texture_path)
+            h, w = color.shape[0], color.shape[1]
+            # For each decimated vertex, find its closest pixel in the original image
+            # Use nearest neighbor projection from 3D to 2D
+            # Project each vertex to pixel coordinates using intrinsics
+            uv = np.zeros((dec_vertices.shape[0], 2), dtype=np.float32)
+            for i, v in enumerate(dec_vertices):
+                # Project to 2D pixel coordinates
+                X, Y, Z = v
+                u_px = (f_x * X / Z) + c_x
+                v_px = (f_y * Y / Z) + c_y
+                # Normalize to [0, 1]
+                u_norm = np.clip((u_px + 0.5) / w, 0, 1)
+                v_norm = np.clip(1.0 - ((v_px + 0.5) / h), 0, 1)  # Flip y-axis, center pixel
+                uv[i, 0] = u_norm
+                uv[i, 1] = v_norm
+
+            # tex_image = Image.open(texture_path)
+            tex_image = Image.open(texture_path).convert("RGB")
+            from trimesh.visual.texture import TextureVisuals
+            visual = TextureVisuals(uv=uv, image=tex_image)
+            dec_mesh = trimesh.Trimesh(
+                vertices=dec_vertices,
+                faces=dec_faces,
+                visual=visual,
+                process=False
+            )
+            glb_output_path = output_path / f"{image_path.stem}_mesh.glb"
+            dec_mesh.export(glb_output_path)
+            LOGGER.info(f"Decimated mesh with texture saved as GLB to {glb_output_path}")
+        except ImportError:
+            LOGGER.warning("trimesh or pyvista is not installed. GLB export skipped.")
+        except Exception as e:
+            LOGGER.warning(f"GLB export failed: {e}")
+
 
 
 
