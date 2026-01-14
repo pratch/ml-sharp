@@ -277,124 +277,6 @@ def predict_cli(
 
     output_path.mkdir(exist_ok=True, parents=True)
 
-<<<<<<< HEAD
-    for image_path in image_paths:
-        # if "aomlion1" not in str(image_path):
-        #     continue
-        output_ply_path = output_path / f"{image_path.stem}.ply"
-        output_json_path = output_path / f"{image_path.stem}.json"
-        output_depth_path = output_path / f"{image_path.stem}.npy"
-
-        if output_ply_path.exists() and output_json_path.exists() and output_depth_path.exists():
-            LOGGER.info("Skipping %s (already processed)", image_path)
-            continue
-
-        LOGGER.info("Processing %s", image_path)
-        image, _, f_px = io.load_rgb(image_path)
-        height, width = image.shape[:2]
-
-        gaussians = None
-        intrinsics = torch.tensor(
-            [
-                [f_px, 0, (width - 1) / 2.0, 0],
-                [0, f_px, (height - 1) / 2.0, 0],
-                [0, 0, 1, 0],
-                [0, 0, 0, 1],
-            ],
-            device=device,
-            dtype=torch.float32,
-        )
-
-        if not output_ply_path.exists():
-            gaussians = predict_image(gaussian_predictor, image, f_px, torch.device(device))
-
-            LOGGER.info("Saving 3DGS to %s", output_path)
-            save_ply(gaussians, f_px, (height, width), output_ply_path)
-        else:
-            LOGGER.info("PLY file %s already exists, skipping.", output_ply_path)
-
-        if not output_json_path.exists():
-            # Compute vertical FOV in degrees
-            vertical_fov_radians = 2 * np.arctan((height / 2) / f_px)
-            vertical_fov_degrees = np.degrees(vertical_fov_radians)
-
-            # Load the saved ply and compute depth statistics
-            ply_path = output_ply_path
-            if ply_path.exists():
-                if gaussians is None:
-                  gaussians, metadata, _, _ = load_ply(ply_path)
-                depths = gaussians.mean_vectors[..., 2].cpu().numpy().flatten()
-                min_depth = float(np.min(depths))
-                max_depth = float(np.max(depths))
-                mean_depth = float(np.mean(depths))
-                median_depth = float(np.median(depths))
-                percentile_1_depth = float(np.percentile(depths, 1))
-                percentile_99_depth = float(np.percentile(depths, 99))
-            else:
-                min_depth = max_depth = mean_depth = median_depth = percentile_1_depth = percentile_99_depth = None
-
-            info = {
-                "image": str(image_path.name),
-                "width": width,
-                "height": height,
-                "vertical_fov_degrees": float(vertical_fov_degrees),
-                "focal_length_px": float(f_px),
-                "min_depth": min_depth,
-                "max_depth": max_depth,
-                "mean_depth": mean_depth,
-                "median_depth": median_depth,
-                "percentile_1_depth": percentile_1_depth,
-                "percentile_99_depth": percentile_99_depth,
-            }
-            # Save info as JSON
-            with open(output_json_path, "w") as f:
-                json.dump(info, f, indent=2)
-        else:
-            LOGGER.info("Info file %s already exists, skipping.", output_json_path)
-
-        if not output_depth_path.exists():
-            if gaussians is None:
-                gaussians, metadata, _, _ = load_ply(output_ply_path)
-            else:
-                metadata = SceneMetaData(intrinsics[0, 0].item(), (width, height), "linearRGB")
-
-            renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
-            rendering_output = renderer(
-                gaussians.to(device),
-                extrinsics=torch.eye(4, device=device).unsqueeze(0),
-                intrinsics=intrinsics.unsqueeze(0),
-                image_width=width,
-                image_height=height,
-            )
-            depth = rendering_output.depth[0]
-            depth_np = depth.cpu().numpy()
-            np.save(output_depth_path, depth_np)
-
-            depth_min = np.nanmin(depth_np)
-            depth_max = np.nanmax(depth_np)
-            if depth_max > depth_min:
-                depth_norm = (depth_np - depth_min) / (depth_max - depth_min)
-            else:
-                depth_norm = np.zeros_like(depth_np)
-            depth_gray = (depth_norm * 255).astype(np.uint8)
-            if depth_gray.ndim == 3:
-                depth_gray = np.squeeze(depth_gray)
-
-            # Save as grayscale PNG
-            io.save_image(depth_gray, output_path / f"{image_path.stem}_gray.png")
-
-            colored_depth_pt = vis.colorize_depth(
-                depth,
-                min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),  # type: ignore[call-overload]
-            )
-            colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
-            io.save_image(colored_depth_np, output_path / f"{image_path.stem}_color.png")
-
-
-        else:
-            LOGGER.info("Depth file %s already exists, skipping.", output_depth_path)
-
-=======
     event_handler = MyEventHandler(gaussian_predictor, input_path, output_path, torch.device(device), with_rendering)
     observer = Observer()
     if input_path.is_file():
@@ -415,7 +297,6 @@ def predict_cli(
         except KeyboardInterrupt:
             observer.stop()
         observer.join()
->>>>>>> b9223094018c0d5578db37456c4e3b1e3a785850
 
 @torch.no_grad()
 def predict_image(
