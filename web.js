@@ -15,7 +15,7 @@ app.get('/', (req, res) => {
 // List all .json files in output2 as links
 const fs = require('fs');
 app.get('/list', (req, res) => {
-  const dir = path.join(__dirname, 'output');
+  const dir = path.join(__dirname, 'output_floodfill');
   // get "ui" get parameter
   const ui = req.query.ui || 'true';
 
@@ -96,7 +96,7 @@ app.get('/api/scenes', (req, res) => {
 });
 
 // Optionally serve static files from 'web' directory
-app.use('/output', express.static(path.join(__dirname, 'output')));
+app.use('/output', express.static(path.join(__dirname, 'output_floodfill')));
 
 // Optionally serve static files from 'web' directory
 app.use('/images', express.static(path.join(__dirname, 'images')));

@@ -273,74 +273,14 @@ def predict_cli(
         LOGGER.info(f"Gaussians in camera space - Z (depth) stats: min={depths_cam.min():.3f}, max={depths_cam.max():.3f}, mean={depths_cam.mean():.3f}")
         LOGGER.info(f"Number of Gaussians with positive depth (in front): {(depths_cam > 0).sum()} / {len(depths_cam)}")
 
-        # Color outlier filtering
-        # colors_gs = gaussians.colors[0].cpu().numpy()
-        # LOGGER.info(f"Gaussian colors - min={colors_gs.min():.3f}, max={colors_gs.max():.3f}, mean={colors_gs.mean(axis=0)}")
-        # LOGGER.info(f"Color space from metadata: {metadata.color_space}")
-        
-        # # Filter out Gaussians with extreme color values to reduce artifacts
-        # color_max_per_gs = colors_gs.max(axis=1)
-        # color_min_per_gs = colors_gs.min(axis=1)
-        
-        # # More aggressive filtering
-        # color_outlier_mask = (color_max_per_gs < 2.0) & (color_min_per_gs > -0.5)
-        
-        # # Also filter by opacity - remove very transparent or very opaque outliers
-        # opacities_gs = gaussians.opacities[0].cpu().numpy()
-        # opacity_mask = (opacities_gs > 0.01) & (opacities_gs < 0.99)
-        
-        # combined_mask = color_outlier_mask & opacity_mask.squeeze()
-        
-        # LOGGER.info(f"Filtering {(~color_outlier_mask).sum()} Gaussians with extreme colors")
-        # LOGGER.info(f"Filtering {(~opacity_mask.squeeze()).sum()} Gaussians with extreme opacities")
-        # LOGGER.info(f"Total filtered: {(~combined_mask).sum()} / {len(combined_mask)}")
-        
-        # gaussians = Gaussians3D(
-        #     mean_vectors=gaussians.mean_vectors[0][combined_mask][None],
-        #     singular_values=gaussians.singular_values[0][combined_mask][None],
-        #     quaternions=gaussians.quaternions[0][combined_mask][None],
-        #     colors=gaussians.colors[0][combined_mask][None],
-        #     opacities=gaussians.opacities[0][combined_mask][None],
-        # )
-        
-        # Try rendering without color space conversion (linear RGB)
+        # Setup renderer for mesh generation
         renderer = gsplat.GSplatRenderer(color_space="linear")
-
-        # Render from multiple azimuth angles
-        azim_range = range(-90, 91, 10)  # -90 to 90 with step 10
-        LOGGER.info(f"Rendering from {len(azim_range)} azimuth angles: {list(azim_range)}")
         
-        for idx, azim in enumerate(azim_range):
-            ext_id_azim = look_at_view_transform(
-                dist=3.0,
-                elev=0.0,
-                azim=float(azim),
-                at=mean_pos,
-                up=[0.0, 1.0, 0.0]
-            )
-            
-            rendering_output = renderer(
-                gaussians.to(device),
-                extrinsics=ext_id_azim.to(device),
-                intrinsics=intrinsics[None],
-                image_width=width,
-                image_height=height,
-            )
-            
-            # Clamp to [0, 1] before converting to uint8 to prevent overflow artifacts
-            color = torch.clamp(rendering_output.color[0], 0.0, 1.0)
-            color = (color.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
-            color = color.cpu().numpy()
-            
-            output_filename = output_path / f"{image_path.stem}_rendered_{idx:02d}.png"
-            io.save_image(color, output_filename)
-            LOGGER.info(f"Saved render {idx:02d} (azim={azim}°) to {output_filename}")
-
-        # Use the middle azimuth angle for depth and normal rendering
+        # Single view rendering for mesh generation
         ext_id = look_at_view_transform(
             dist=3.0,
             elev=0.0,
-            azim=0.0,  # Center view
+            azim=-50.0,  # Adjust azimuth as needed for mesh generation
             at=mean_pos,
             up=[0.0, 1.0, 0.0]
         )
@@ -353,9 +293,26 @@ def predict_cli(
             image_height=height,
         )
 
-        # depth = np.load(output_depth_path)
-        depth = rendering_output.depth[0].cpu().numpy()
-        print(depth.shape, depth.dtype, depth.min(), depth.max())
+        # Extract depth and color
+        depth = rendering_output.depth[0]
+        depth_np = depth.cpu().numpy()
+        color = torch.clamp(rendering_output.color[0], 0.0, 1.0)
+        color = (color.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+        color = color.cpu().numpy()
+        
+        LOGGER.info(f"Depth stats: shape={depth_np.shape}, min={depth_np.min():.3f}, max={depth_np.max():.3f}")
+        
+        # Save rendered view
+        io.save_image(color, output_path / f"{image_path.stem}_rendered.png")
+        
+        # Save depth visualization (same as predict_with_info.py)
+        colored_depth_pt = vis.colorize_depth(
+            depth,
+            min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),
+        )
+        colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+        io.save_image(colored_depth_np, output_path / f"{image_path.stem}_rawdepth.png")
+        LOGGER.info(f"Saved depth visualization to {output_path / f'{image_path.stem}_rawdepth.png'}")
 
         # Compute and render normal map
         quats = gaussians.quaternions[0].to(device)  # [N, 4]
@@ -413,42 +370,135 @@ def predict_cli(
         io.save_image(normal_map, output_path / f"{image_path.stem}_normals.png")
         LOGGER.info(f"Saved normal map to {output_path / f'{image_path.stem}_normals.png'}")
 
-        exit(0)
-
-        # Apply gaussian blur to the depth
-        depth_blurred = cv.GaussianBlur(depth[0], (5, 5), 0)
+        # Apply gaussian blur to the depth (squeeze to 2D first)
+        depth_2d = depth_np.squeeze()  # Remove singleton dimensions
+        depth_blurred = cv.GaussianBlur(depth_2d, (5, 5), 0)
         depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
         depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
 
-        h, w = depth.shape[1], depth.shape[2]
+        h, w = depth_2d.shape[0], depth_2d.shape[1]
         f_x = intrinsics[0, 0].item()
         f_y = intrinsics[1, 1].item()
         c_x = intrinsics[0, 2].item()
         c_y = intrinsics[1, 2].item()
 
-        # Segment Gaussians in 3D using BFS
-        segments = segment_gaussians_3d_bfs(
+        # Segment Gaussians in 3D using BFS with PCA-based geometry
+        # PCA normals will be saved inside the function before BFS starts
+        segments, pca_normals = segment_gaussians_3d_bfs(
             gaussians,
             device,
-            k_neighbors=10,
-            normal_threshold=0.5,  # Relaxed: allow more normal variation
-            distance_threshold=0.5,  # Increased from 0.1 to 0.5 meters
-            color_threshold=0.5,  # Relaxed: allow more color variation
+            k_neighbors_pca=200,  # Large k for stable PCA normal estimation
+            k_neighbors_bfs=50,   # Smaller k for fast BFS traversal
+            normal_angle_threshold_deg=30.0,  # 30° angle threshold (relaxed from 15°)
+            distance_threshold=0.5,  # meters
+            color_threshold=0.8,  # normalized color difference (relaxed from 0.5)
+            planarity_threshold=0.7,  # Westin's planarity > 0.7 for planar surfaces
+            # Visualization parameters
+            extrinsics=ext_id,
+            intrinsics=intrinsics,
+            color_image=color,
+            output_path=output_path,
+            image_stem=image_path.stem,
         )
 
         # Process each segment to create a mesh
         for seg_idx, segment_indices in enumerate(segments):
             LOGGER.info(f"Processing segment {seg_idx} with {len(segment_indices)} Gaussians")
             
+            # Log segment size relative to total
+            total_gaussians = gaussians.mean_vectors[0].shape[0]
+            segment_percentage = 100.0 * len(segment_indices) / total_gaussians
+            LOGGER.info(f"Segment {seg_idx} contains {segment_percentage:.2f}% of all Gaussians")
+            
+            # Render segmented Gaussians with blue tint
+            # Create a copy of gaussians with segmented ones tinted blue
+            gaussians_highlighted = Gaussians3D(
+                mean_vectors=gaussians.mean_vectors.clone(),
+                singular_values=gaussians.singular_values.clone(),
+                quaternions=gaussians.quaternions.clone(),
+                colors=gaussians.colors.clone(),
+                opacities=gaussians.opacities.clone(),
+            )
+            
+            # Apply strong blue tint and increase opacity for segmented Gaussians
+            segment_colors = gaussians_highlighted.colors[0][segment_indices].clone()
+            segment_colors[:, 0] = 0.0  # Zero red
+            segment_colors[:, 1] = 0.0  # Zero green
+            segment_colors[:, 2] = 1.0  # Full blue
+            gaussians_highlighted.colors[0][segment_indices] = segment_colors
+            
+            # Increase opacity of segmented Gaussians to make them more visible
+            segment_opacities = gaussians_highlighted.opacities[0][segment_indices].clone()
+            segment_opacities = torch.clamp(segment_opacities * 2.0, 0.0, 1.0)  # Double opacity
+            gaussians_highlighted.opacities[0][segment_indices] = segment_opacities
+            
+            LOGGER.info(f"Segment {seg_idx}: Set {len(segment_indices)} Gaussians to pure blue (0,0,255)")
+            
+            # Render the highlighted gaussians
+            rendering_highlighted = renderer(
+                gaussians_highlighted.to(device),
+                extrinsics=ext_id.to(device),
+                intrinsics=intrinsics[None],
+                image_width=width,
+                image_height=height,
+            )
+            
+            color_highlighted = torch.clamp(rendering_highlighted.color[0], 0.0, 1.0)
+            color_highlighted = (color_highlighted.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+            color_highlighted = color_highlighted.cpu().numpy()
+            
+            # Check if there's any blue in the rendered image
+            blue_pixels = np.sum(color_highlighted[:, :, 2] > color_highlighted[:, :, 0] + 50)
+            total_pixels = color_highlighted.shape[0] * color_highlighted.shape[1]
+            blue_percentage = 100.0 * blue_pixels / total_pixels
+            LOGGER.info(f"Segment {seg_idx}: {blue_pixels} blue pixels ({blue_percentage:.2f}% of image)")
+            
+            io.save_image(color_highlighted, output_path / f"{image_path.stem}_seg{seg_idx}_rendered.png")
+            LOGGER.info(f"Saved segment {seg_idx} rendering with blue highlight to {output_path / f'{image_path.stem}_seg{seg_idx}_rendered.png'}")
+            
+            # Also render ONLY the segmented Gaussians to see where they are without occlusion
+            gaussians_only_segment = Gaussians3D(
+                mean_vectors=gaussians.mean_vectors[0][segment_indices][None],
+                singular_values=gaussians.singular_values[0][segment_indices][None],
+                quaternions=gaussians.quaternions[0][segment_indices][None],
+                colors=gaussians.colors[0][segment_indices][None],  # Original colors
+                opacities=gaussians.opacities[0][segment_indices][None],
+            )
+            
+            rendering_only_segment = renderer(
+                gaussians_only_segment.to(device),
+                extrinsics=ext_id.to(device),
+                intrinsics=intrinsics[None],
+                image_width=width,
+                image_height=height,
+            )
+            
+            color_only_segment = torch.clamp(rendering_only_segment.color[0], 0.0, 1.0)
+            color_only_segment = (color_only_segment.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+            color_only_segment = color_only_segment.cpu().numpy()
+            
+            # Count non-black pixels to see coverage
+            non_black_pixels = np.sum(color_only_segment.max(axis=2) > 10)
+            segment_coverage = 100.0 * non_black_pixels / total_pixels
+            LOGGER.info(f"Segment {seg_idx} (isolated): {non_black_pixels} visible pixels ({segment_coverage:.2f}% of image)")
+            
+            io.save_image(color_only_segment, output_path / f"{image_path.stem}_seg{seg_idx}_only.png")
+            LOGGER.info(f"Saved isolated segment {seg_idx} rendering to {output_path / f'{image_path.stem}_seg{seg_idx}_only.png'}")
+            
             # Create mask for this segment by projecting GS points to 2D
             mask = np.zeros((h, w), dtype=np.uint8)
             
-            # Get segment Gaussian means
+            # Get segment Gaussian means in world space
             segment_means = gaussians.mean_vectors[0][segment_indices].cpu().numpy()  # [M, 3]
             
+            # Transform to camera space using extrinsics
+            segment_means_homo = np.concatenate([segment_means, np.ones((len(segment_means), 1))], axis=1)  # [M, 4]
+            ext_np = ext_id[0].cpu().numpy()
+            segment_means_cam = (ext_np @ segment_means_homo.T).T  # [M, 4]
+            
             # Project each Gaussian to image plane and mark in mask
-            for mean_3d in segment_means:
-                X, Y, Z = mean_3d
+            for i in range(len(segment_means_cam)):
+                X, Y, Z = segment_means_cam[i, :3]
                 if Z <= 0:
                     continue
                 u = int(round((f_x * X / Z) + c_x))
@@ -654,55 +704,42 @@ def save_depth(depth_np, name):
 def segment_gaussians_3d_bfs(
     gaussians,
     device,
-    k_neighbors=10,
-    normal_threshold=0.7,  # cosine similarity threshold
+    k_neighbors_pca=200,  # Number of neighbors for PCA normal estimation (more = stable)
+    k_neighbors_bfs=30,   # Number of neighbors for BFS traversal (less = fast)
+    normal_angle_threshold_deg=15.0,  # Normal angle threshold in degrees
     distance_threshold=0.1,  # meters
     color_threshold=0.3,  # normalized color difference
+    planarity_threshold=0.7,  # Westin's planarity: p = (λ_mid - λ_min) / λ_max (p > 0.7 for planar surfaces)
+    # Visualization parameters (optional)
+    extrinsics=None,
+    intrinsics=None,
+    color_image=None,
+    output_path=None,
+    image_stem=None,
 ):
     """
-    Segment Gaussian Splats in 3D using BFS traversal.
+    Segment Gaussian Splats in 3D using BFS traversal with PCA-based geometry estimation.
+    
+    Uses neighborhood PCA to estimate local surface properties:
+    - Normal direction from smallest eigenvector
+    - Westin's planarity as p = (λ_mid - λ_min) / λ_max for detecting planar surfaces
     
     Args:
         gaussians: Gaussians3D object
         device: torch device
-        k_neighbors: number of nearest neighbors to consider
-        normal_threshold: cosine similarity threshold for normals (higher = more similar required)
+        k_neighbors_pca: number of nearest neighbors for PCA (default 200, more = stable)
+        k_neighbors_bfs: number of nearest neighbors for BFS traversal (default 30, less = fast)
+        normal_angle_threshold_deg: maximum angle difference between normals in degrees
         distance_threshold: maximum 3D distance between neighbors
         color_threshold: maximum color difference (L2 distance in [0,1] RGB space)
+        planarity_threshold: minimum Westin's planarity (p > 0.7 for planar surfaces)
     
     Returns:
         List of segments, where each segment is a list of GS indices
     """
-    # Get Gaussian properties
+    # Get Gaussian properties - ONLY using center positions
     means_3d = gaussians.mean_vectors[0].to(device)  # [N, 3]
     colors = gaussians.colors[0].to(device)  # [N, 3], assuming RGB in [0, 1]
-    
-    # Compute normals from covariance matrices
-    # Using the smallest eigenvector as the normal direction
-    quats = gaussians.quaternions[0].to(device)  # [N, 4]
-    scales = gaussians.singular_values[0].to(device)  # [N, 3]
-    
-    # Convert quaternions to rotation matrices
-    # q = [w, x, y, z]
-    w, x, y, z = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
-    
-    # Rotation matrix from quaternion
-    R = torch.stack([
-        torch.stack([1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)], dim=-1),
-        torch.stack([2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)], dim=-1),
-        torch.stack([2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)], dim=-1),
-    ], dim=-2)  # [N, 3, 3]
-    
-    # Find the axis with smallest scale (the normal direction for flat Gaussians)
-    min_scale_idx = torch.argmin(scales, dim=1)  # [N]
-    
-    # Extract the corresponding column from rotation matrix
-    normals = torch.zeros((R.shape[0], 3), device=device)
-    for i in range(3):
-        mask = (min_scale_idx == i)
-        normals[mask] = R[mask, :, i]
-    
-    normals = F.normalize(normals, dim=-1)
     
     # Compute KNN using scipy KDTree (efficient, no OOM issues)
     N = means_3d.shape[0]
@@ -712,13 +749,116 @@ def segment_gaussians_3d_bfs(
     means_3d_cpu = means_3d.cpu().numpy()
     tree = KDTree(means_3d_cpu)
     
-    # Query k+1 nearest neighbors (including self)
-    LOGGER.info(f"Querying {k_neighbors} nearest neighbors...")
-    knn_dists_np, knn_indices_np = tree.query(means_3d_cpu, k=k_neighbors + 1)
+    # Query k_neighbors_pca+1 nearest neighbors (including self) for PCA
+    LOGGER.info(f"Querying {k_neighbors_pca} neighbors for PCA, {k_neighbors_bfs} for BFS...")
+    knn_dists_np, knn_indices_np = tree.query(means_3d_cpu, k=k_neighbors_pca + 1)
     
-    # Exclude self (first neighbor) and convert back to torch
-    knn_indices = torch.from_numpy(knn_indices_np[:, 1:]).to(device)  # [N, k]
-    knn_dists = torch.from_numpy(knn_dists_np[:, 1:]).to(device).float()  # [N, k]
+    # Include self (first neighbor) for PCA computation
+    knn_indices_pca = torch.from_numpy(knn_indices_np).to(device)  # [N, k_pca+1]
+    
+    # For BFS, only keep first k_neighbors_bfs neighbors (excluding self)
+    knn_indices = torch.from_numpy(knn_indices_np[:, 1:k_neighbors_bfs+1]).to(device)  # [N, k_bfs]
+    knn_dists = torch.from_numpy(knn_dists_np[:, 1:k_neighbors_bfs+1]).to(device).float()  # [N, k_bfs]
+    
+    # Compute PCA for each point to get normals and surface variation
+    LOGGER.info("Computing PCA-based normals and surface variation...")
+    
+    # Batched PCA computation (much faster than for-loop)
+    # Get all neighborhoods at once
+    all_neighborhoods = means_3d[knn_indices_pca]  # [N, k+1, 3]
+    
+    # Check for NaN values in means
+    if torch.isnan(all_neighborhoods).any():
+        nan_count = torch.isnan(all_neighborhoods).sum().item()
+        LOGGER.warning(f"Found {nan_count} NaN values in neighborhood data, replacing with zeros")
+        all_neighborhoods = torch.nan_to_num(all_neighborhoods, nan=0.0)
+    
+    # Center each neighborhood
+    centroids = all_neighborhoods.mean(dim=1, keepdim=True)  # [N, 1, 3]
+    centered = all_neighborhoods - centroids  # [N, k+1, 3]
+    
+    # Compute covariance matrices in batch: C = (1/k) * X^T * X
+    # For each point: cov = centered.T @ centered / k
+    cov_matrices = torch.bmm(centered.transpose(1, 2), centered) / (k_neighbors_pca + 1)  # [N, 3, 3]
+    
+    # Add small regularization to diagonal for numerical stability
+    eye_batch = torch.eye(3, device=device).unsqueeze(0).expand(N, -1, -1)  # [N, 3, 3]
+    cov_matrices = cov_matrices + 1e-6 * eye_batch
+    
+    # Check for NaN/Inf in covariance matrices
+    if torch.isnan(cov_matrices).any() or torch.isinf(cov_matrices).any():
+        nan_count = torch.isnan(cov_matrices).sum().item()
+        inf_count = torch.isinf(cov_matrices).sum().item()
+        LOGGER.warning(f"Found {nan_count} NaN and {inf_count} Inf values in covariance matrices")
+        cov_matrices = torch.nan_to_num(cov_matrices, nan=0.0, posinf=1e6, neginf=-1e6)
+    
+    # Move to CPU for more robust eigenvalue decomposition (CUDA has numerical issues)
+    LOGGER.info("Performing eigenvalue decomposition on CPU for numerical stability...")
+    cov_matrices_cpu = cov_matrices.cpu().double()  # Use float64 for better stability
+    
+    # Batch eigenvalue decomposition on CPU
+    eigenvalues_cpu, eigenvectors_cpu = torch.linalg.eigh(cov_matrices_cpu)  # [N, 3], [N, 3, 3]
+    
+    # Move results back to GPU as float32
+    eigenvalues = eigenvalues_cpu.to(device).float()
+    eigenvectors = eigenvectors_cpu.to(device).float()
+    
+    # Extract normals (eigenvector of smallest eigenvalue - first column)
+    normals = eigenvectors[:, :, 0]  # [N, 3]
+    
+    # Compute Westin's planarity: p = (λ_mid - λ_min) / λ_max
+    # For planar surfaces, λ_min and λ_mid are both small (close to 0), λ_max is large
+    # High planarity (close to 1) indicates flat surface
+    lambda_min = eigenvalues[:, 0]  # [N] - smallest eigenvalue
+    lambda_mid = eigenvalues[:, 1]  # [N] - middle eigenvalue
+    lambda_max = eigenvalues[:, 2]  # [N] - largest eigenvalue
+    planarities = (lambda_mid - lambda_min) / (lambda_max + 1e-8)  # [N]
+    
+    # Handle degenerate cases (all eigenvalues near zero)
+    planarities = torch.where(lambda_max > 1e-8, planarities, torch.zeros_like(planarities))
+    
+    # Normalize normals
+    normals = F.normalize(normals, dim=-1)
+    
+    LOGGER.info(f"Westin's planarity stats: min={planarities.min():.4f}, max={planarities.max():.4f}, mean={planarities.mean():.4f}")
+    LOGGER.info(f"Points with p > {planarity_threshold}: {(planarities > planarity_threshold).sum()} / {N}")
+    
+    # Save PCA normals visualization if requested
+    if extrinsics is not None and intrinsics is not None and output_path is not None and image_stem is not None:
+        from sharp.utils.gaussians import Gaussians3D, save_ply
+        from sharp.utils import gsplat
+        
+        # Get original gaussians metadata
+        width = int(intrinsics[0, 2].item() * 2 + 1)
+        height = int(intrinsics[1, 2].item() * 2 + 1)
+        f_px = intrinsics[0, 0].item()
+        
+        # Create gaussians with PCA normals as colors
+        gaussians_with_pca_normals = Gaussians3D(
+            mean_vectors=gaussians.mean_vectors,
+            singular_values=gaussians.singular_values,
+            quaternions=gaussians.quaternions,
+            colors=((normals + 1.0) / 2.0).cpu().unsqueeze(0),  # Map [-1,1] to [0,1]
+            opacities=gaussians.opacities,
+        )
+        
+        save_ply(gaussians_with_pca_normals.to("cpu"), f_px, (height, width), output_path / f"{image_stem}_pca_normals_gs.ply")
+        LOGGER.info(f"Saved PCA normal Gaussians to {output_path / f'{image_stem}_pca_normals_gs.ply'}")
+        
+        # Render PCA normal map
+        renderer = gsplat.GSplatRenderer(color_space="linear")
+        pca_normal_rendering = renderer(
+            gaussians_with_pca_normals.to(normals.device),
+            extrinsics=extrinsics.to(normals.device),
+            intrinsics=intrinsics[None],
+            image_width=width,
+            image_height=height,
+        )
+        
+        pca_normal_map = (pca_normal_rendering.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+        pca_normal_map = pca_normal_map.cpu().numpy()
+        io.save_image(pca_normal_map, output_path / f"{image_stem}_pca_normals.png")
+        LOGGER.info(f"Saved PCA normal map to {output_path / f'{image_stem}_pca_normals.png'}")
     
     # Get depth values (Z coordinate in camera space)
     depths = means_3d[:, 2]  # [N]
@@ -726,97 +866,161 @@ def segment_gaussians_3d_bfs(
     # Sort points by depth (closest first)
     sorted_indices = torch.argsort(depths)
     
-    N = means_3d.shape[0]
     visited = torch.zeros(N, dtype=torch.bool, device=device)
     segments = []
     
-    # BFS segmentation - TEST MODE: Only process first seed
-    seed_idx = sorted_indices[0].item()
+    # Compute cosine threshold from angle
+    normal_threshold = np.cos(np.deg2rad(normal_angle_threshold_deg))
+    LOGGER.info(f"Normal angle threshold: {normal_angle_threshold_deg}° (cosine similarity > {normal_threshold:.4f})")
     
-    LOGGER.info(f"Starting BFS from seed {seed_idx} with depth {depths[seed_idx].item():.3f}")
+    max_segments = 10  # Maximum number of segments to find
+    min_segment_size = 50  # Minimum segment size
     
-    # Start a new segment
-    segment = []
-    queue = deque([seed_idx])
-    visited[seed_idx] = True
-    
-    # Reference properties from seed
-    seed_normal = normals[seed_idx]
-    seed_color = colors[seed_idx]
-    
-    # Counters for debugging
-    total_neighbors_checked = 0
-    failed_distance = 0
-    failed_normal = 0
-    failed_color = 0
-    
-    max_segment_size = 100000  # Stop after 100k points
-    
-    while queue and len(segment) < max_segment_size:
-        current_idx = queue.popleft()
-        segment.append(current_idx)
+    # BFS segmentation - Continue until no more valid seeds or max segments reached
+    for seg_num in range(max_segments):
+        # Find next seed from unvisited points with lowest σ (flattest surface)
+        unvisited_mask = ~visited
+        if unvisited_mask.sum() == 0:
+            LOGGER.info(f"All Gaussians visited, stopping segmentation")
+            break
         
-        # Progress logging every 10k points
-        if len(segment) % 10000 == 0:
-            LOGGER.info(f"  BFS progress: {len(segment)} points, queue size: {len(queue)}")
+        # Get flattest unvisited point as seed (highest planarity)
+        unvisited_planarities = planarities.clone()
+        unvisited_planarities[visited] = float('-inf')  # Mask visited points
+        seed_idx = torch.argmax(unvisited_planarities).item()
         
-        # Get current properties
-        current_normal = normals[current_idx]
-        current_color = colors[current_idx]
+        if planarities[seed_idx] < planarity_threshold:
+            LOGGER.info(f"No more planar unvisited points (p={planarities[seed_idx].item():.4f} < {planarity_threshold}), stopping")
+            break
         
-        # Check all neighbors
-        neighbors = knn_indices[current_idx]  # [k]
-        neighbor_dists = knn_dists[current_idx]  # [k]
+        LOGGER.info(f"\n=== Segment {seg_num}: Starting BFS from seed {seed_idx} with p={planarities[seed_idx].item():.4f} ===")
         
-        for i in range(k_neighbors):
-            neighbor_idx = neighbors[i].item()
-            total_neighbors_checked += 1
+        # Visualize seed point if visualization parameters provided
+        if extrinsics is not None and intrinsics is not None and color_image is not None:
+            # Transform seed point to camera space
+            seed_pos_world = means_3d[seed_idx].cpu().numpy()  # [3]
+            seed_pos_homo = np.append(seed_pos_world, 1.0)  # [4]
+            ext_np = extrinsics[0].cpu().numpy()
+            seed_pos_cam = ext_np @ seed_pos_homo  # [4]
             
-            if visited[neighbor_idx]:
-                continue
+            X, Y, Z = seed_pos_cam[:3]
+            if Z > 0:
+                f_x = intrinsics[0, 0].item()
+                f_y = intrinsics[1, 1].item()
+                c_x = intrinsics[0, 2].item()
+                c_y = intrinsics[1, 2].item()
+                h, w = color_image.shape[0], color_image.shape[1]
+                
+                u_seed = int(round((f_x * X / Z) + c_x))
+                v_seed = int(round((f_y * Y / Z) + c_y))
+                
+                # Draw seed point on rendered image
+                color_with_seed = color_image.copy()
+                if 0 <= v_seed < h and 0 <= u_seed < w:
+                    # Draw a blue circle at seed location (5px radius)
+                    cv.circle(color_with_seed, (u_seed, v_seed), radius=5, color=(0, 0, 255), thickness=-1)
+                    cv.circle(color_with_seed, (u_seed, v_seed), radius=7, color=(255, 255, 255), thickness=1)
+                    LOGGER.info(f"Seed point at pixel ({u_seed}, {v_seed}), p={planarities[seed_idx].item():.4f}")
+                
+                if output_path is not None and image_stem is not None:
+                    io.save_image(color_with_seed, output_path / f"{image_stem}_seg{seg_num}_seed.png")
+                    LOGGER.info(f"Saved seed visualization to {output_path / f'{image_stem}_seg{seg_num}_seed.png'}")
+        
+        # Start a new segment
+        segment = []
+        queue = deque([seed_idx])
+        visited[seed_idx] = True
+        
+        # Reference properties from seed
+        seed_normal = normals[seed_idx]
+        seed_color = colors[seed_idx]
+        
+        # Counters for debugging
+        total_neighbors_checked = 0
+        failed_distance = 0
+        failed_normal = 0
+        failed_color = 0
+        failed_planarity = 0
+        
+        max_segment_size = 100000  # Stop after 100k points
+        
+        while queue and len(segment) < max_segment_size:
+            current_idx = queue.popleft()
+            segment.append(current_idx)
             
-            # Check distance threshold
-            if neighbor_dists[i] > distance_threshold:
-                failed_distance += 1
-                continue
+            # Progress logging every 10k points
+            if len(segment) % 10000 == 0:
+                LOGGER.info(f"  BFS progress: {len(segment)} points, queue size: {len(queue)}")
             
-            neighbor_normal = normals[neighbor_idx]
-            neighbor_color = colors[neighbor_idx]
+            # Get current properties
+            current_normal = normals[current_idx]
+            current_color = colors[current_idx]
             
-            # Check normal similarity (cosine similarity with seed)
-            normal_similarity = torch.dot(seed_normal, neighbor_normal)
-            if normal_similarity < normal_threshold:
-                failed_normal += 1
-                continue
+            # Check all neighbors
+            neighbors = knn_indices[current_idx]  # [k_bfs]
+            neighbor_dists = knn_dists[current_idx]  # [k_bfs]
             
-            # Check color similarity (L2 distance with seed)
-            color_diff = torch.norm(seed_color - neighbor_color)
-            if color_diff > color_threshold:
-                failed_color += 1
-                continue
-            
-            # Add to segment
-            visited[neighbor_idx] = True
-            queue.append(neighbor_idx)
+            for i in range(k_neighbors_bfs):
+                neighbor_idx = neighbors[i].item()
+                total_neighbors_checked += 1
+                
+                if visited[neighbor_idx]:
+                    continue
+                
+                # Check distance threshold
+                if neighbor_dists[i] > distance_threshold:
+                    failed_distance += 1
+                    continue
+                
+                # Check planarity threshold (must be planar surface)
+                if planarities[neighbor_idx] < planarity_threshold:
+                    failed_planarity += 1
+                    continue
+                
+                neighbor_normal = normals[neighbor_idx]
+                neighbor_color = colors[neighbor_idx]
+                
+                # Check normal angle (dot product with current normal)
+                normal_similarity = torch.dot(current_normal, neighbor_normal)
+                if normal_similarity < normal_threshold:
+                    failed_normal += 1
+                    continue
+                
+                # Check color similarity (L2 distance with seed)
+                # COMMENTED OUT: Don't use color for segmentation, only geometry
+                # color_diff = torch.norm(seed_color - neighbor_color)
+                # if color_diff > color_threshold:
+                #     failed_color += 1
+                #     continue
+                
+                # Add to segment
+                visited[neighbor_idx] = True
+                queue.append(neighbor_idx)
+        
+        LOGGER.info(f"Segment {seg_num} BFS complete: segment size = {len(segment)}")
+        LOGGER.info(f"  Total neighbors checked: {total_neighbors_checked}")
+        LOGGER.info(f"  Failed distance check: {failed_distance}")
+        LOGGER.info(f"  Failed planarity check: {failed_planarity}")
+        LOGGER.info(f"  Failed normal check: {failed_normal}")
+        LOGGER.info(f"  Failed color check: {failed_color}")
+        
+        # Only keep segment if it has reasonable size
+        if len(segment) >= min_segment_size:
+            segments.append(segment)
+            LOGGER.info(f"Segment {seg_num} added (size {len(segment)} >= {min_segment_size})")
+        else:
+            LOGGER.warning(f"Segment {seg_num} too small ({len(segment)} < {min_segment_size}), not added")
     
-    LOGGER.info(f"BFS complete: segment size = {len(segment)}")
-    LOGGER.info(f"  Total neighbors checked: {total_neighbors_checked}")
-    LOGGER.info(f"  Failed distance check: {failed_distance}")
-    LOGGER.info(f"  Failed normal check: {failed_normal}")
-    LOGGER.info(f"  Failed color check: {failed_color}")
-    
-    # Only keep segment if it has reasonable size
-    if len(segment) > 50:  # Minimum segment size
-        segments.append(segment)
-        LOGGER.info(f"Segment added (size {len(segment)} > 50)")
-    else:
-        LOGGER.warning(f"Segment too small ({len(segment)} <= 50), not added")
-    
-    LOGGER.info(f"Segmented {N} Gaussians into {len(segments)} segments (TEST MODE: 1 seed only)")
+    LOGGER.info(f"\n=== Segmentation complete: {len(segments)} segments found from {N} Gaussians ===")
     for i, seg in enumerate(segments):
-        LOGGER.info(f"  Segment {i}: {len(seg)} Gaussians")
+        percentage = 100.0 * len(seg) / N
+        LOGGER.info(f"  Segment {i}: {len(seg)} Gaussians ({percentage:.2f}%)")
     
-    return segments
+    unvisited_count = (~visited).sum().item()
+    unvisited_percentage = 100.0 * unvisited_count / N
+    LOGGER.info(f"  Unvisited: {unvisited_count} Gaussians ({unvisited_percentage:.2f}%)")
+    
+    return segments, normals
 
 
 if __name__ == "__main__":
