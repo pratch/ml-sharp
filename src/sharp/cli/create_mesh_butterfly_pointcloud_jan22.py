@@ -170,6 +170,12 @@ def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, 
     help="Device to run on. ['cpu', 'mps', 'cuda']",
 )
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
+@click.option(
+    "--object-filter",
+    type=str,
+    default=None,
+    help="Filter images by object name (e.g., 'butterfly'). If not provided, processes all images.",
+)
 def predict_cli(
     input_path: Path,
     output_path: Path,
@@ -177,6 +183,7 @@ def predict_cli(
     with_rendering: bool,
     device: str,
     verbose: bool,
+    object_filter: str,
 ):
     # Initialize logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -185,6 +192,10 @@ def predict_cli(
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         force=True
     )
+    
+    # Create output directory if it doesn't exist
+    output_path.mkdir(parents=True, exist_ok=True)
+    LOGGER.info(f"Output directory: {output_path}")
     
     device = torch.device("cuda")
 
@@ -199,7 +210,7 @@ def predict_cli(
 
     for image_path in image_paths:
         # if "441902" not in str(image_path):
-        if "butterfly" not in str(image_path):
+        if object_filter is not None and object_filter not in str(image_path):
             continue
         # output_depth_path = output_path / f"{image_path.stem}.npy"
 
@@ -212,7 +223,16 @@ def predict_cli(
             LOGGER.info("Mesh files for %s already exist, skipping.", image_path.stem)
             continue
 
-        gaussians, metadata, _, _ = load_ply(output_path / f"{image_path.stem}.ply")
+        # Check for .ply file in output_path first, then fallback to splats/ folder
+        ply_path = output_path / f"{image_path.stem}.ply"
+        if not ply_path.exists():
+            ply_path = Path("splats") / f"{image_path.stem}.ply"
+            if not ply_path.exists():
+                LOGGER.warning(f"Could not find .ply file for {image_path.stem} in {output_path} or splats/")
+                continue
+            LOGGER.info(f"Loading .ply from fallback location: {ply_path}")
+        
+        gaussians, metadata, _, _ = load_ply(ply_path)
         width, height = metadata.resolution_px
         f_px = metadata.focal_length_px
         
@@ -384,282 +404,25 @@ def predict_cli(
 
         # Segment Gaussians in 3D using BFS with PCA-based geometry
         # PCA normals will be saved inside the function before BFS starts
+        # Segments will be processed and rendered as they are found
         segments, pca_normals = segment_gaussians_3d_bfs(
             gaussians,
             device,
-            k_neighbors_pca=200,  # Large k for stable PCA normal estimation
-            k_neighbors_bfs=50,   # Smaller k for fast BFS traversal
+            k_neighbors_pca=750,  # Large k for stable PCA normal estimation
+            k_neighbors_bfs=100,   # Smaller k for fast BFS traversal
             normal_angle_threshold_deg=30.0,  # 30° angle threshold (relaxed from 15°)
             distance_threshold=0.5,  # meters
             color_threshold=0.8,  # normalized color difference (relaxed from 0.5)
-            planarity_threshold=0.7,  # Westin's planarity > 0.7 for planar surfaces
-            # Visualization parameters
+            planarity_threshold=0.6,  # Westin's planarity > 0.7 for planar surfaces
+            # Visualization and rendering parameters
             extrinsics=ext_id,
             intrinsics=intrinsics,
             color_image=color,
+            depth_blurred=depth_blurred,
+            renderer=renderer,
             output_path=output_path,
             image_stem=image_path.stem,
         )
-
-        # Process each segment to create a mesh
-        for seg_idx, segment_indices in enumerate(segments):
-            LOGGER.info(f"Processing segment {seg_idx} with {len(segment_indices)} Gaussians")
-            
-            # Log segment size relative to total
-            total_gaussians = gaussians.mean_vectors[0].shape[0]
-            segment_percentage = 100.0 * len(segment_indices) / total_gaussians
-            LOGGER.info(f"Segment {seg_idx} contains {segment_percentage:.2f}% of all Gaussians")
-            
-            # Render segmented Gaussians with blue tint
-            # Create a copy of gaussians with segmented ones tinted blue
-            gaussians_highlighted = Gaussians3D(
-                mean_vectors=gaussians.mean_vectors.clone(),
-                singular_values=gaussians.singular_values.clone(),
-                quaternions=gaussians.quaternions.clone(),
-                colors=gaussians.colors.clone(),
-                opacities=gaussians.opacities.clone(),
-            )
-            
-            # Apply strong blue tint and increase opacity for segmented Gaussians
-            segment_colors = gaussians_highlighted.colors[0][segment_indices].clone()
-            segment_colors[:, 0] = 0.0  # Zero red
-            segment_colors[:, 1] = 0.0  # Zero green
-            segment_colors[:, 2] = 1.0  # Full blue
-            gaussians_highlighted.colors[0][segment_indices] = segment_colors
-            
-            # Increase opacity of segmented Gaussians to make them more visible
-            segment_opacities = gaussians_highlighted.opacities[0][segment_indices].clone()
-            segment_opacities = torch.clamp(segment_opacities * 2.0, 0.0, 1.0)  # Double opacity
-            gaussians_highlighted.opacities[0][segment_indices] = segment_opacities
-            
-            LOGGER.info(f"Segment {seg_idx}: Set {len(segment_indices)} Gaussians to pure blue (0,0,255)")
-            
-            # Render the highlighted gaussians
-            rendering_highlighted = renderer(
-                gaussians_highlighted.to(device),
-                extrinsics=ext_id.to(device),
-                intrinsics=intrinsics[None],
-                image_width=width,
-                image_height=height,
-            )
-            
-            color_highlighted = torch.clamp(rendering_highlighted.color[0], 0.0, 1.0)
-            color_highlighted = (color_highlighted.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
-            color_highlighted = color_highlighted.cpu().numpy()
-            
-            # Check if there's any blue in the rendered image
-            blue_pixels = np.sum(color_highlighted[:, :, 2] > color_highlighted[:, :, 0] + 50)
-            total_pixels = color_highlighted.shape[0] * color_highlighted.shape[1]
-            blue_percentage = 100.0 * blue_pixels / total_pixels
-            LOGGER.info(f"Segment {seg_idx}: {blue_pixels} blue pixels ({blue_percentage:.2f}% of image)")
-            
-            io.save_image(color_highlighted, output_path / f"{image_path.stem}_seg{seg_idx}_rendered.png")
-            LOGGER.info(f"Saved segment {seg_idx} rendering with blue highlight to {output_path / f'{image_path.stem}_seg{seg_idx}_rendered.png'}")
-            
-            # Also render ONLY the segmented Gaussians to see where they are without occlusion
-            gaussians_only_segment = Gaussians3D(
-                mean_vectors=gaussians.mean_vectors[0][segment_indices][None],
-                singular_values=gaussians.singular_values[0][segment_indices][None],
-                quaternions=gaussians.quaternions[0][segment_indices][None],
-                colors=gaussians.colors[0][segment_indices][None],  # Original colors
-                opacities=gaussians.opacities[0][segment_indices][None],
-            )
-            
-            rendering_only_segment = renderer(
-                gaussians_only_segment.to(device),
-                extrinsics=ext_id.to(device),
-                intrinsics=intrinsics[None],
-                image_width=width,
-                image_height=height,
-            )
-            
-            color_only_segment = torch.clamp(rendering_only_segment.color[0], 0.0, 1.0)
-            color_only_segment = (color_only_segment.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
-            color_only_segment = color_only_segment.cpu().numpy()
-            
-            # Count non-black pixels to see coverage
-            non_black_pixels = np.sum(color_only_segment.max(axis=2) > 10)
-            segment_coverage = 100.0 * non_black_pixels / total_pixels
-            LOGGER.info(f"Segment {seg_idx} (isolated): {non_black_pixels} visible pixels ({segment_coverage:.2f}% of image)")
-            
-            io.save_image(color_only_segment, output_path / f"{image_path.stem}_seg{seg_idx}_only.png")
-            LOGGER.info(f"Saved isolated segment {seg_idx} rendering to {output_path / f'{image_path.stem}_seg{seg_idx}_only.png'}")
-            
-            # Create mask for this segment by projecting GS points to 2D
-            mask = np.zeros((h, w), dtype=np.uint8)
-            
-            # Get segment Gaussian means in world space
-            segment_means = gaussians.mean_vectors[0][segment_indices].cpu().numpy()  # [M, 3]
-            
-            # Transform to camera space using extrinsics
-            segment_means_homo = np.concatenate([segment_means, np.ones((len(segment_means), 1))], axis=1)  # [M, 4]
-            ext_np = ext_id[0].cpu().numpy()
-            segment_means_cam = (ext_np @ segment_means_homo.T).T  # [M, 4]
-            
-            # Project each Gaussian to image plane and mark in mask
-            for i in range(len(segment_means_cam)):
-                X, Y, Z = segment_means_cam[i, :3]
-                if Z <= 0:
-                    continue
-                u = int(round((f_x * X / Z) + c_x))
-                v = int(round((f_y * Y / Z) + c_y))
-                if 0 <= v < h and 0 <= u < w:
-                    mask[v, u] = 1
-            
-            # Dilate mask to fill small gaps
-            kernel = np.ones((5, 5), np.uint8)
-            mask = cv.dilate(mask, kernel, iterations=3)
-            mask = cv.erode(mask, kernel, iterations=2)
-
-            cv.imwrite(output_path / f"{image_path.stem}_seg{seg_idx}_mask.png", mask * 255)
-
-            # Extract masked depth and color and compute vertices
-            effective_mask = mask
-            rows, cols = np.where(effective_mask == 1)
-
-            if len(rows) == 0:
-                LOGGER.warning(f"No masked pixels found for segment {seg_idx}. Skipping.")
-                continue
-
-            # Extract depth and color values for the masked pixels
-            masked_depth_values = depth_blurred[rows, cols]
-            masked_color_values = color[rows, cols]
-
-            vertices = []
-            vertex_colors = []
-            vertex_map = {}
-
-            vertex_idx_counter = 0
-            for i in range(len(rows)):
-                r, c = rows[i], cols[i]
-                d = masked_depth_values[i]
-
-                # Skip invalid or zero depth values
-                if np.isnan(d) or d <= 0:
-                    continue
-
-                # Unproject 2D pixel (c, r) with depth d to 3D point (x, y, z) in camera coordinates
-                x = (c - c_x) * d / f_x
-                y = (r - c_y) * d / f_y
-                z = d
-
-                vertices.append([x, y, z])
-                vertex_colors.append(masked_color_values[i].tolist())
-                vertex_map[(r, c)] = vertex_idx_counter
-                vertex_idx_counter += 1
-
-            if not vertices:
-                LOGGER.warning(f"No valid 3D points for segment {seg_idx}. Skipping.")
-                continue
-
-            LOGGER.info(f"Segment {seg_idx}: {len(vertices)} vertices generated.")
-            vertices_np = np.array(vertices, dtype=np.float32)
-            vertex_colors_np = np.array(vertex_colors, dtype=np.uint8)
-
-            # 2. Triangulation: Create faces by connecting 2x2 blocks of masked pixels
-            faces = []
-            for r in range(h - 1):
-                for c in range(w - 1): 
-                    # Check if all four corners of the 2x2 block are within the masked region
-                    if (
-                        effective_mask[r, c]
-                        and effective_mask[r + 1, c]
-                        and effective_mask[r, c + 1]
-                        and effective_mask[r + 1, c + 1]
-                    ):
-                        # Get the vertex indices for the four corners from the vertex_map
-                        idx_rc = vertex_map.get((r, c))
-                        idx_r1c = vertex_map.get((r + 1, c))
-                        idx_rc1 = vertex_map.get((r, c + 1))
-                        idx_r1c1 = vertex_map.get((r + 1, c + 1))
-
-                        # Ensure all four corner vertices were valid
-                        if all(idx is not None for idx in [idx_rc, idx_r1c, idx_rc1, idx_r1c1]):
-                            # Create two triangles from the quadrilateral
-                            faces.append([idx_rc, idx_r1c, idx_rc1])
-                            faces.append([idx_r1c, idx_r1c1, idx_rc1])
-
-            if not faces:
-                LOGGER.warning(f"No faces generated for segment {seg_idx}. Skipping.")
-                continue
-
-            # 3. Save the mesh as a PLY file
-            seg_mesh_output_path = output_path / f"{image_path.stem}_seg{seg_idx}_mesh.ply"
-            with open(seg_mesh_output_path, "w") as f:
-                f.write("ply\n")
-                f.write("format ascii 1.0\n")
-                f.write(f"element vertex {len(vertices_np)}\n")
-                f.write("property float x\n")
-                f.write("property float y\n")
-                f.write("property float z\n")
-                f.write("property uchar red\n")
-                f.write("property uchar green\n")
-                f.write("property uchar blue\n")
-                f.write(f"element face {len(faces)}\n")
-                f.write("property list uchar int vertex_indices\n")
-                f.write("end_header\n")
-
-                # Write vertex data
-                for i in range(len(vertices_np)):
-                    v = vertices_np[i]
-                    c = vertex_colors_np[i]
-                    f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {c[0]} {c[1]} {c[2]}\n")
-
-                # Write face data
-                for face in faces:
-                    f.write(f"3 {' '.join(map(str, face))}\n")
-
-            LOGGER.info(f"Segment {seg_idx}: Mesh with {len(vertices_np)} vertices and {len(faces)} faces saved to {seg_mesh_output_path}")
-
-            # 3b. Save the mesh as a GLB (glTF binary) file using trimesh
-            try:
-                import trimesh
-                import pyvista as pv
-                pv_mesh = pv.PolyData(vertices_np, np.hstack((np.full((len(faces), 1), 3, dtype=np.int64), np.array(faces, dtype=np.int64))).astype(np.int64))
-                target_reduction = 0.99
-                decimated = pv_mesh.decimate_pro(target_reduction, preserve_topology=True, boundary_vertex_deletion=True)
-
-                dec_vertices = decimated.points.astype(np.float32)
-                dec_faces = decimated.faces.reshape(-1, 4)[:, 1:4]
-
-                # Map colors if possible, else use mean color
-                if hasattr(decimated, 'point_arrays') and 'RGB' in decimated.point_arrays:
-                    dec_colors = decimated.point_arrays['RGB'].astype(np.uint8)
-                else:
-                    mean_color = vertex_colors_np.mean(axis=0).astype(np.uint8)
-                    dec_colors = np.tile(mean_color, (dec_vertices.shape[0], 1))
-
-                # --- Texture and UV generation ---
-                texture_path = output_path / f"{image_path.stem}_seg{seg_idx}_texture.png"
-                io.save_image(color, texture_path)
-                # Project each vertex to pixel coordinates using intrinsics
-                uv = np.zeros((dec_vertices.shape[0], 2), dtype=np.float32)
-                for i, v in enumerate(dec_vertices):
-                    X, Y, Z = v
-                    u_px = (f_x * X / Z) + c_x
-                    v_px = (f_y * Y / Z) + c_y
-                    # Normalize to [0, 1]
-                    u_norm = np.clip((u_px + 0.5) / w, 0, 1)
-                    v_norm = np.clip(1.0 - ((v_px + 0.5) / h), 0, 1)
-                    uv[i, 0] = u_norm
-                    uv[i, 1] = v_norm
-
-                tex_image = Image.open(texture_path).convert("RGB")
-                from trimesh.visual.texture import TextureVisuals
-                visual = TextureVisuals(uv=uv, image=tex_image)
-                dec_mesh = trimesh.Trimesh(
-                    vertices=dec_vertices,
-                    faces=dec_faces,
-                    visual=visual,
-                    process=False
-                )
-                seg_glb_output_path = output_path / f"{image_path.stem}_seg{seg_idx}_mesh.glb"
-                dec_mesh.export(seg_glb_output_path)
-                LOGGER.info(f"Segment {seg_idx}: Decimated mesh with texture saved as GLB to {seg_glb_output_path}")
-            except ImportError:
-                LOGGER.warning("trimesh or pyvista is not installed. GLB export skipped.")
-            except Exception as e:
-                LOGGER.warning(f"GLB export failed for segment {seg_idx}: {e}")
 
         # After processing all segments, create a combined pruned Gaussians file
         # Remove Gaussians that belong to any segment
@@ -701,6 +464,225 @@ def save_depth(depth_np, name):
 
     io.save_image(depth_gray, name)
 
+def process_segment_mesh(
+    seg_idx,
+    segment_indices,
+    gaussians,
+    renderer,
+    device,
+    extrinsics,
+    intrinsics,
+    color_image,
+    depth_blurred,
+    output_path,
+    image_stem,
+):
+    """Process a segment: render visualizations and create mesh."""
+    LOGGER.info(f"Processing segment {seg_idx} with {len(segment_indices)} Gaussians")
+    
+    # Log segment size relative to total
+    total_gaussians = gaussians.mean_vectors[0].shape[0]
+    segment_percentage = 100.0 * len(segment_indices) / total_gaussians
+    LOGGER.info(f"Segment {seg_idx} contains {segment_percentage:.2f}% of all Gaussians")
+    
+    # Get image dimensions
+    h, w = color_image.shape[0], color_image.shape[1]
+    width = int(intrinsics[0, 2].item() * 2 + 1)
+    height = int(intrinsics[1, 2].item() * 2 + 1)
+    f_x = intrinsics[0, 0].item()
+    f_y = intrinsics[1, 1].item()
+    c_x = intrinsics[0, 2].item()
+    c_y = intrinsics[1, 2].item()
+    
+    # Render segmented Gaussians with blue tint
+    gaussians_highlighted = Gaussians3D(
+        mean_vectors=gaussians.mean_vectors.clone(),
+        singular_values=gaussians.singular_values.clone(),
+        quaternions=gaussians.quaternions.clone(),
+        colors=gaussians.colors.clone(),
+        opacities=gaussians.opacities.clone(),
+    )
+    
+    # Apply strong blue tint and increase opacity
+    segment_colors = gaussians_highlighted.colors[0][segment_indices].clone()
+    segment_colors[:, 0] = 0.0  # Zero red
+    segment_colors[:, 1] = 0.0  # Zero green
+    segment_colors[:, 2] = 1.0  # Full blue
+    gaussians_highlighted.colors[0][segment_indices] = segment_colors
+    
+    segment_opacities = gaussians_highlighted.opacities[0][segment_indices].clone()
+    segment_opacities = torch.clamp(segment_opacities * 2.0, 0.0, 1.0)
+    gaussians_highlighted.opacities[0][segment_indices] = segment_opacities
+    
+    # Render highlighted gaussians
+    rendering_highlighted = renderer(
+        gaussians_highlighted.to(device),
+        extrinsics=extrinsics.to(device),
+        intrinsics=intrinsics[None],
+        image_width=width,
+        image_height=height,
+    )
+    
+    color_highlighted = torch.clamp(rendering_highlighted.color[0], 0.0, 1.0)
+    color_highlighted = (color_highlighted.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+    color_highlighted = color_highlighted.cpu().numpy()
+    
+    io.save_image(color_highlighted, output_path / f"{image_stem}_seg{seg_idx}_rendered.png")
+    
+    # Render ONLY the segmented Gaussians
+    gaussians_only_segment = Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[0][segment_indices][None],
+        singular_values=gaussians.singular_values[0][segment_indices][None],
+        quaternions=gaussians.quaternions[0][segment_indices][None],
+        colors=gaussians.colors[0][segment_indices][None],
+        opacities=gaussians.opacities[0][segment_indices][None],
+    )
+    
+    rendering_only_segment = renderer(
+        gaussians_only_segment.to(device),
+        extrinsics=extrinsics.to(device),
+        intrinsics=intrinsics[None],
+        image_width=width,
+        image_height=height,
+    )
+    
+    color_only_segment = torch.clamp(rendering_only_segment.color[0], 0.0, 1.0)
+    color_only_segment = (color_only_segment.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+    color_only_segment = color_only_segment.cpu().numpy()
+    
+    io.save_image(color_only_segment, output_path / f"{image_stem}_seg{seg_idx}_only.png")
+    
+    # Create mask by projecting GS points to 2D
+    mask = np.zeros((h, w), dtype=np.uint8)
+    segment_means = gaussians.mean_vectors[0][segment_indices].cpu().numpy()
+    segment_means_homo = np.concatenate([segment_means, np.ones((len(segment_means), 1))], axis=1)
+    ext_np = extrinsics[0].cpu().numpy()
+    segment_means_cam = (ext_np @ segment_means_homo.T).T
+    
+    for i in range(len(segment_means_cam)):
+        X, Y, Z = segment_means_cam[i, :3]
+        if Z <= 0:
+            continue
+        u = int(round((f_x * X / Z) + c_x))
+        v = int(round((f_y * Y / Z) + c_y))
+        if 0 <= v < h and 0 <= u < w:
+            mask[v, u] = 1
+    
+    # Dilate mask
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv.dilate(mask, kernel, iterations=3)
+    mask = cv.erode(mask, kernel, iterations=2)
+    cv.imwrite(str(output_path / f"{image_stem}_seg{seg_idx}_mask.png"), mask * 255)
+
+    # Extract masked depth and color
+    rows, cols = np.where(mask == 1)
+    if len(rows) == 0:
+        LOGGER.warning(f"No masked pixels for segment {seg_idx}")
+        return
+
+    masked_depth_values = depth_blurred[rows, cols]
+    masked_color_values = color_image[rows, cols]
+
+    vertices = []
+    vertex_colors = []
+    vertex_map = {}
+
+    for i in range(len(rows)):
+        r, c = rows[i], cols[i]
+        d = masked_depth_values[i]
+        if np.isnan(d) or d <= 0:
+            continue
+
+        x = (c - c_x) * d / f_x
+        y = (r - c_y) * d / f_y
+        z = d
+
+        vertices.append([x, y, z])
+        vertex_colors.append(masked_color_values[i].tolist())
+        vertex_map[(r, c)] = len(vertices) - 1
+
+    if not vertices:
+        LOGGER.warning(f"No valid 3D points for segment {seg_idx}")
+        return
+
+    vertices_np = np.array(vertices, dtype=np.float32)
+    vertex_colors_np = np.array(vertex_colors, dtype=np.uint8)
+
+    # Triangulation
+    faces = []
+    for r in range(h - 1):
+        for c in range(w - 1):
+            if (mask[r, c] and mask[r + 1, c] and mask[r, c + 1] and mask[r + 1, c + 1]):
+                idx_rc = vertex_map.get((r, c))
+                idx_r1c = vertex_map.get((r + 1, c))
+                idx_rc1 = vertex_map.get((r, c + 1))
+                idx_r1c1 = vertex_map.get((r + 1, c + 1))
+
+                if all(idx is not None for idx in [idx_rc, idx_r1c, idx_rc1, idx_r1c1]):
+                    faces.append([idx_rc, idx_r1c, idx_rc1])
+                    faces.append([idx_r1c, idx_r1c1, idx_rc1])
+
+    if not faces:
+        LOGGER.warning(f"No faces for segment {seg_idx}")
+        return
+
+    # Save PLY
+    seg_mesh_output_path = output_path / f"{image_stem}_seg{seg_idx}_mesh.ply"
+    with open(seg_mesh_output_path, "w") as f:
+        f.write("ply\n")
+        f.write("format ascii 1.0\n")
+        f.write(f"element vertex {len(vertices_np)}\n")
+        f.write("property float x\n")
+        f.write("property float y\n")
+        f.write("property float z\n")
+        f.write("property uchar red\n")
+        f.write("property uchar green\n")
+        f.write("property uchar blue\n")
+        f.write(f"element face {len(faces)}\n")
+        f.write("property list uchar int vertex_indices\n")
+        f.write("end_header\n")
+
+        for i in range(len(vertices_np)):
+            v = vertices_np[i]
+            c = vertex_colors_np[i]
+            f.write(f"{v[0]:.6f} {v[1]:.6f} {v[2]:.6f} {c[0]} {c[1]} {c[2]}\n")
+
+        for face in faces:
+            f.write(f"3 {' '.join(map(str, face))}\n")
+
+    LOGGER.info(f"Segment {seg_idx}: Saved mesh with {len(vertices_np)} vertices, {len(faces)} faces")
+
+    # Save GLB
+    try:
+        import trimesh
+        import pyvista as pv
+        pv_mesh = pv.PolyData(vertices_np, np.hstack((np.full((len(faces), 1), 3, dtype=np.int64), np.array(faces, dtype=np.int64))).astype(np.int64))
+        decimated = pv_mesh.decimate_pro(0.99, preserve_topology=True, boundary_vertex_deletion=True)
+
+        dec_vertices = decimated.points.astype(np.float32)
+        dec_faces = decimated.faces.reshape(-1, 4)[:, 1:4]
+
+        texture_path = output_path / f"{image_stem}_seg{seg_idx}_texture.png"
+        io.save_image(color_image, texture_path)
+        
+        uv = np.zeros((dec_vertices.shape[0], 2), dtype=np.float32)
+        for i, v in enumerate(dec_vertices):
+            X, Y, Z = v
+            u_px = (f_x * X / Z) + c_x
+            v_px = (f_y * Y / Z) + c_y
+            uv[i, 0] = np.clip((u_px + 0.5) / w, 0, 1)
+            uv[i, 1] = np.clip(1.0 - ((v_px + 0.5) / h), 0, 1)
+
+        tex_image = Image.open(texture_path).convert("RGB")
+        from trimesh.visual.texture import TextureVisuals
+        visual = TextureVisuals(uv=uv, image=tex_image)
+        dec_mesh = trimesh.Trimesh(vertices=dec_vertices, faces=dec_faces, visual=visual, process=False)
+        seg_glb_output_path = output_path / f"{image_stem}_seg{seg_idx}_mesh.glb"
+        dec_mesh.export(seg_glb_output_path)
+        LOGGER.info(f"Segment {seg_idx}: Saved GLB")
+    except Exception as e:
+        LOGGER.warning(f"GLB export failed for segment {seg_idx}: {e}")
+
 def segment_gaussians_3d_bfs(
     gaussians,
     device,
@@ -710,10 +692,12 @@ def segment_gaussians_3d_bfs(
     distance_threshold=0.1,  # meters
     color_threshold=0.3,  # normalized color difference
     planarity_threshold=0.7,  # Westin's planarity: p = (λ_mid - λ_min) / λ_max (p > 0.7 for planar surfaces)
-    # Visualization parameters (optional)
+    # Visualization and rendering parameters (optional)
     extrinsics=None,
     intrinsics=None,
     color_image=None,
+    depth_blurred=None,  # For mesh generation
+    renderer=None,  # For rendering segments
     output_path=None,
     image_stem=None,
 ):
@@ -807,7 +791,7 @@ def segment_gaussians_3d_bfs(
     normals = eigenvectors[:, :, 0]  # [N, 3]
     
     # Compute Westin's planarity: p = (λ_mid - λ_min) / λ_max
-    # For planar surfaces, λ_min and λ_mid are both small (close to 0), λ_max is large
+    # For planar surfaces, λ_min is very small, λ_mid is larger, λ_max is largest, so p approaches 1.
     # High planarity (close to 1) indicates flat surface
     lambda_min = eigenvalues[:, 0]  # [N] - smallest eigenvalue
     lambda_mid = eigenvalues[:, 1]  # [N] - middle eigenvalue
@@ -859,6 +843,35 @@ def segment_gaussians_3d_bfs(
         pca_normal_map = pca_normal_map.cpu().numpy()
         io.save_image(pca_normal_map, output_path / f"{image_stem}_pca_normals.png")
         LOGGER.info(f"Saved PCA normal map to {output_path / f'{image_stem}_pca_normals.png'}")
+        
+        # Render only planar Gaussians (planarity > threshold)
+        planar_mask = planarities > planarity_threshold
+        planar_count = planar_mask.sum().item()
+        LOGGER.info(f"Rendering {planar_count} planar Gaussians (p > {planarity_threshold})")
+        
+        if planar_count > 0:
+            planar_indices = torch.where(planar_mask)[0].cpu()  # Move to CPU for indexing
+            gaussians_planar = Gaussians3D(
+                mean_vectors=gaussians.mean_vectors[0][planar_indices][None],
+                singular_values=gaussians.singular_values[0][planar_indices][None],
+                quaternions=gaussians.quaternions[0][planar_indices][None],
+                colors=gaussians.colors[0][planar_indices][None],
+                opacities=gaussians.opacities[0][planar_indices][None],
+            )
+            
+            planar_rendering = renderer(
+                gaussians_planar.to(normals.device),
+                extrinsics=extrinsics.to(normals.device),
+                intrinsics=intrinsics[None],
+                image_width=width,
+                image_height=height,
+            )
+            
+            planar_map = torch.clamp(planar_rendering.color[0], 0.0, 1.0)
+            planar_map = (planar_map.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+            planar_map = planar_map.cpu().numpy()
+            io.save_image(planar_map, output_path / f"{image_stem}_planar_gs.png")
+            LOGGER.info(f"Saved planar Gaussians rendering to {output_path / f'{image_stem}_planar_gs.png'}")
     
     # Get depth values (Z coordinate in camera space)
     depths = means_3d[:, 2]  # [N]
@@ -866,7 +879,13 @@ def segment_gaussians_3d_bfs(
     # Sort points by depth (closest first)
     sorted_indices = torch.argsort(depths)
     
-    visited = torch.zeros(N, dtype=torch.bool, device=device)
+    # Pre-filter: Mark all non-planar Gaussians as visited so they're never considered
+    # This prevents redundant planarity checks during BFS expansion
+    visited = planarities < planarity_threshold  # True for non-planar GS
+    non_planar_count = visited.sum().item()
+    LOGGER.info(f"Pre-filtered {non_planar_count} non-planar Gaussians (p < {planarity_threshold})")
+    LOGGER.info(f"Remaining candidates for segmentation: {N - non_planar_count}")
+    
     segments = []
     
     # Compute cosine threshold from angle
@@ -874,7 +893,7 @@ def segment_gaussians_3d_bfs(
     LOGGER.info(f"Normal angle threshold: {normal_angle_threshold_deg}° (cosine similarity > {normal_threshold:.4f})")
     
     max_segments = 10  # Maximum number of segments to find
-    min_segment_size = 50  # Minimum segment size
+    min_segment_size = 10000  # Minimum segment size
     
     # BFS segmentation - Continue until no more valid seeds or max segments reached
     for seg_num in range(max_segments):
@@ -940,9 +959,8 @@ def segment_gaussians_3d_bfs(
         failed_distance = 0
         failed_normal = 0
         failed_color = 0
-        failed_planarity = 0
         
-        max_segment_size = 100000  # Stop after 100k points
+        max_segment_size = 600000  # Stop after 600k points
         
         while queue and len(segment) < max_segment_size:
             current_idx = queue.popleft()
@@ -972,10 +990,7 @@ def segment_gaussians_3d_bfs(
                     failed_distance += 1
                     continue
                 
-                # Check planarity threshold (must be planar surface)
-                if planarities[neighbor_idx] < planarity_threshold:
-                    failed_planarity += 1
-                    continue
+                # No need to check planarity - already pre-filtered in visited mask
                 
                 neighbor_normal = normals[neighbor_idx]
                 neighbor_color = colors[neighbor_idx]
@@ -1000,7 +1015,6 @@ def segment_gaussians_3d_bfs(
         LOGGER.info(f"Segment {seg_num} BFS complete: segment size = {len(segment)}")
         LOGGER.info(f"  Total neighbors checked: {total_neighbors_checked}")
         LOGGER.info(f"  Failed distance check: {failed_distance}")
-        LOGGER.info(f"  Failed planarity check: {failed_planarity}")
         LOGGER.info(f"  Failed normal check: {failed_normal}")
         LOGGER.info(f"  Failed color check: {failed_color}")
         
@@ -1008,6 +1022,23 @@ def segment_gaussians_3d_bfs(
         if len(segment) >= min_segment_size:
             segments.append(segment)
             LOGGER.info(f"Segment {seg_num} added (size {len(segment)} >= {min_segment_size})")
+            
+            # Process segment immediately if rendering parameters provided
+            if (renderer is not None and extrinsics is not None and intrinsics is not None 
+                and output_path is not None and image_stem is not None and depth_blurred is not None):
+                process_segment_mesh(
+                    seg_idx=seg_num,
+                    segment_indices=segment,
+                    gaussians=gaussians,
+                    renderer=renderer,
+                    device=device,
+                    extrinsics=extrinsics,
+                    intrinsics=intrinsics,
+                    color_image=color_image,
+                    depth_blurred=depth_blurred,
+                    output_path=output_path,
+                    image_stem=image_stem,
+                )
         else:
             LOGGER.warning(f"Segment {seg_num} too small ({len(segment)} < {min_segment_size}), not added")
     
