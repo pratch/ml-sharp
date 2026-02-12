@@ -418,7 +418,6 @@ def predict_cli(
             extrinsics=ext_id,
             intrinsics=intrinsics,
             color_image=color,
-            depth_blurred=depth_blurred,
             renderer=renderer,
             output_path=output_path,
             image_stem=image_path.stem,
@@ -473,7 +472,6 @@ def process_segment_mesh(
     extrinsics,
     intrinsics,
     color_image,
-    depth_blurred,
     output_path,
     image_stem,
 ):
@@ -493,6 +491,31 @@ def process_segment_mesh(
     f_y = intrinsics[1, 1].item()
     c_x = intrinsics[0, 2].item()
     c_y = intrinsics[1, 2].item()
+    
+    # Render depth map ONLY for this segment (not all Gaussians)
+    gaussians_only_segment = Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[0][segment_indices][None],
+        singular_values=gaussians.singular_values[0][segment_indices][None],
+        quaternions=gaussians.quaternions[0][segment_indices][None],
+        colors=gaussians.colors[0][segment_indices][None],
+        opacities=gaussians.opacities[0][segment_indices][None],
+    )
+    
+    rendering_segment_depth = renderer(
+        gaussians_only_segment.to(device),
+        extrinsics=extrinsics.to(device),
+        intrinsics=intrinsics[None],
+        image_width=width,
+        image_height=height,
+    )
+    
+    # Get segment-specific depth and apply Gaussian blur
+    depth_segment = rendering_segment_depth.depth[0].cpu().numpy().squeeze()
+    depth_blurred = cv.GaussianBlur(depth_segment, (5, 5), 0)
+    depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
+    depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
+    
+    LOGGER.info(f"Segment {seg_idx} depth stats: min={depth_segment.min():.3f}, max={depth_segment.max():.3f}")
     
     # Render segmented Gaussians with blue tint
     gaussians_highlighted = Gaussians3D(
@@ -529,15 +552,7 @@ def process_segment_mesh(
     
     io.save_image(color_highlighted, output_path / f"{image_stem}_seg{seg_idx}_rendered.png")
     
-    # Render ONLY the segmented Gaussians
-    gaussians_only_segment = Gaussians3D(
-        mean_vectors=gaussians.mean_vectors[0][segment_indices][None],
-        singular_values=gaussians.singular_values[0][segment_indices][None],
-        quaternions=gaussians.quaternions[0][segment_indices][None],
-        colors=gaussians.colors[0][segment_indices][None],
-        opacities=gaussians.opacities[0][segment_indices][None],
-    )
-    
+    # Render ONLY the segmented Gaussians (reuse gaussians_only_segment from depth computation)
     rendering_only_segment = renderer(
         gaussians_only_segment.to(device),
         extrinsics=extrinsics.to(device),
@@ -607,9 +622,27 @@ def process_segment_mesh(
 
     vertices_np = np.array(vertices, dtype=np.float32)
     vertex_colors_np = np.array(vertex_colors, dtype=np.uint8)
+    
+    # Transform vertices from camera space to world space
+    # Convert to homogeneous coordinates
+    vertices_homo = np.concatenate([vertices_np, np.ones((len(vertices_np), 1))], axis=1)  # [N, 4]
+    
+    # Get inverse of extrinsics (world-to-camera -> camera-to-world)
+    ext_np = extrinsics[0].cpu().numpy()
+    ext_inv = np.linalg.inv(ext_np)  # [4, 4]
+    
+    # Transform to world space
+    vertices_world = (ext_inv @ vertices_homo.T).T  # [N, 4]
+    vertices_np = vertices_world[:, :3].astype(np.float32)  # [N, 3]
+    
+    LOGGER.info(f"Transformed {len(vertices_np)} vertices from camera to world space")
+    LOGGER.info(f"World space bbox: min={vertices_np.min(axis=0)}, max={vertices_np.max(axis=0)}")
 
-    # Triangulation
+    # Triangulation with depth discontinuity filtering
+    depth_threshold = 0.05  # 5cm threshold - reject triangles with edges spanning large depth differences
     faces = []
+    rejected_faces = 0
+    
     for r in range(h - 1):
         for c in range(w - 1):
             if (mask[r, c] and mask[r + 1, c] and mask[r, c + 1] and mask[r + 1, c + 1]):
@@ -619,8 +652,35 @@ def process_segment_mesh(
                 idx_r1c1 = vertex_map.get((r + 1, c + 1))
 
                 if all(idx is not None for idx in [idx_rc, idx_r1c, idx_rc1, idx_r1c1]):
-                    faces.append([idx_rc, idx_r1c, idx_rc1])
-                    faces.append([idx_r1c, idx_r1c1, idx_rc1])
+                    # Get depths for all 4 vertices
+                    d_rc = depth_blurred[r, c]
+                    d_r1c = depth_blurred[r + 1, c]
+                    d_rc1 = depth_blurred[r, c + 1]
+                    d_r1c1 = depth_blurred[r + 1, c + 1]
+                    
+                    # First triangle: [idx_rc, idx_r1c, idx_rc1]
+                    # Check edges: (rc, r1c), (r1c, rc1), (rc1, rc)
+                    edge1 = abs(d_rc - d_r1c)
+                    edge2 = abs(d_r1c - d_rc1)
+                    edge3 = abs(d_rc1 - d_rc)
+                    
+                    if max(edge1, edge2, edge3) < depth_threshold:
+                        faces.append([idx_rc, idx_r1c, idx_rc1])
+                    else:
+                        rejected_faces += 1
+                    
+                    # Second triangle: [idx_r1c, idx_r1c1, idx_rc1]
+                    # Check edges: (r1c, r1c1), (r1c1, rc1), (rc1, r1c)
+                    edge1 = abs(d_r1c - d_r1c1)
+                    edge2 = abs(d_r1c1 - d_rc1)
+                    edge3 = abs(d_rc1 - d_r1c)
+                    
+                    if max(edge1, edge2, edge3) < depth_threshold:
+                        faces.append([idx_r1c, idx_r1c1, idx_rc1])
+                    else:
+                        rejected_faces += 1
+
+    LOGGER.info(f"Segment {seg_idx}: Triangulation - {len(faces)} faces created, {rejected_faces} rejected due to depth discontinuities")
 
     if not faces:
         LOGGER.warning(f"No faces for segment {seg_idx}")
@@ -665,9 +725,16 @@ def process_segment_mesh(
         texture_path = output_path / f"{image_stem}_seg{seg_idx}_texture.png"
         io.save_image(color_image, texture_path)
         
+        # For UV computation, transform world space vertices back to camera space
         uv = np.zeros((dec_vertices.shape[0], 2), dtype=np.float32)
-        for i, v in enumerate(dec_vertices):
-            X, Y, Z = v
+        dec_vertices_homo = np.concatenate([dec_vertices, np.ones((len(dec_vertices), 1))], axis=1)  # [N, 4]
+        dec_vertices_cam = (ext_np @ dec_vertices_homo.T).T  # [N, 4] - transform to camera space
+        
+        for i in range(len(dec_vertices_cam)):
+            X, Y, Z = dec_vertices_cam[i, :3]
+            if Z <= 0:
+                # Skip vertices behind camera
+                continue
             u_px = (f_x * X / Z) + c_x
             v_px = (f_y * Y / Z) + c_y
             uv[i, 0] = np.clip((u_px + 0.5) / w, 0, 1)
@@ -696,7 +763,6 @@ def segment_gaussians_3d_bfs(
     extrinsics=None,
     intrinsics=None,
     color_image=None,
-    depth_blurred=None,  # For mesh generation
     renderer=None,  # For rendering segments
     output_path=None,
     image_stem=None,
@@ -892,7 +958,7 @@ def segment_gaussians_3d_bfs(
     normal_threshold = np.cos(np.deg2rad(normal_angle_threshold_deg))
     LOGGER.info(f"Normal angle threshold: {normal_angle_threshold_deg}° (cosine similarity > {normal_threshold:.4f})")
     
-    max_segments = 10  # Maximum number of segments to find
+    max_segments = 3  # Maximum number of segments to find
     min_segment_size = 10000  # Minimum segment size
     
     # BFS segmentation - Continue until no more valid seeds or max segments reached
@@ -1025,7 +1091,7 @@ def segment_gaussians_3d_bfs(
             
             # Process segment immediately if rendering parameters provided
             if (renderer is not None and extrinsics is not None and intrinsics is not None 
-                and output_path is not None and image_stem is not None and depth_blurred is not None):
+                and output_path is not None and image_stem is not None):
                 process_segment_mesh(
                     seg_idx=seg_num,
                     segment_indices=segment,
@@ -1035,7 +1101,6 @@ def segment_gaussians_3d_bfs(
                     extrinsics=extrinsics,
                     intrinsics=intrinsics,
                     color_image=color_image,
-                    depth_blurred=depth_blurred,
                     output_path=output_path,
                     image_stem=image_stem,
                 )
