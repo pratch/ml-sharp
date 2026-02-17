@@ -300,7 +300,7 @@ def predict_cli(
         ext_id = look_at_view_transform(
             dist=3.0,
             elev=0.0,
-            azim=-50.0,  # Adjust azimuth as needed for mesh generation
+            azim=-20.0, # -50.0,  # Adjust azimuth as needed for mesh generation (try -50, -35, -20)
             at=mean_pos,
             up=[0.0, 1.0, 0.0]
         )
@@ -411,7 +411,8 @@ def predict_cli(
             k_neighbors_pca=750,  # Large k for stable PCA normal estimation
             k_neighbors_bfs=100,   # Smaller k for fast BFS traversal
             normal_angle_threshold_deg=30.0,  # 30° angle threshold (relaxed from 15°)
-            distance_threshold=0.5,  # meters
+            distance_threshold=0.5,  # meters (for BFS traversal)
+            pca_distance_threshold=0.3,  # meters (max distance for PCA neighbors)
             color_threshold=0.8,  # normalized color difference (relaxed from 0.5)
             planarity_threshold=0.6,  # Westin's planarity > 0.7 for planar surfaces
             # Visualization and rendering parameters
@@ -511,7 +512,27 @@ def process_segment_mesh(
     
     # Get segment-specific depth and apply Gaussian blur
     depth_segment = rendering_segment_depth.depth[0].cpu().numpy().squeeze()
-    depth_blurred = cv.GaussianBlur(depth_segment, (5, 5), 0)
+    
+    # Inpaint holes in depth map for smoother mesh
+    valid_depth_mask = ((depth_segment > 0) & ~np.isnan(depth_segment)).astype(np.uint8)
+    invalid_mask = 1 - valid_depth_mask
+    
+    # Count holes before inpainting
+    hole_count = invalid_mask.sum()
+    total_pixels = depth_segment.size
+    hole_percentage = 100.0 * hole_count / total_pixels
+    LOGGER.info(f"Segment {seg_idx} depth holes: {hole_count} / {total_pixels} ({hole_percentage:.2f}%)")
+    
+    # Inpaint small holes (up to 10 pixels radius)
+    depth_inpainted = cv.inpaint(
+        depth_segment.astype(np.float32),
+        invalid_mask,
+        inpaintRadius=10,
+        flags=cv.INPAINT_TELEA
+    )
+    
+    # Apply Gaussian blur to inpainted depth
+    depth_blurred = cv.GaussianBlur(depth_inpainted, (5, 5), 0)
     depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
     depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
     
@@ -756,7 +777,8 @@ def segment_gaussians_3d_bfs(
     k_neighbors_pca=200,  # Number of neighbors for PCA normal estimation (more = stable)
     k_neighbors_bfs=30,   # Number of neighbors for BFS traversal (less = fast)
     normal_angle_threshold_deg=15.0,  # Normal angle threshold in degrees
-    distance_threshold=0.1,  # meters
+    distance_threshold=0.1,  # meters (for BFS traversal)
+    pca_distance_threshold=0.5,  # meters (max distance for PCA neighbors)
     color_threshold=0.3,  # normalized color difference
     planarity_threshold=0.7,  # Westin's planarity: p = (λ_mid - λ_min) / λ_max (p > 0.7 for planar surfaces)
     # Visualization and rendering parameters (optional)
@@ -813,45 +835,95 @@ def segment_gaussians_3d_bfs(
     # Compute PCA for each point to get normals and surface variation
     LOGGER.info("Computing PCA-based normals and surface variation...")
     
-    # Batched PCA computation (much faster than for-loop)
-    # Get all neighborhoods at once
-    all_neighborhoods = means_3d[knn_indices_pca]  # [N, k+1, 3]
+    # Filter PCA neighbors by distance threshold
+    LOGGER.info(f"Filtering PCA neighbors by distance threshold: {pca_distance_threshold}m")
+    knn_dists_pca = torch.from_numpy(knn_dists_np).to(device).float()  # [N, k_pca+1]
     
-    # Check for NaN values in means
-    if torch.isnan(all_neighborhoods).any():
-        nan_count = torch.isnan(all_neighborhoods).sum().item()
-        LOGGER.warning(f"Found {nan_count} NaN values in neighborhood data, replacing with zeros")
-        all_neighborhoods = torch.nan_to_num(all_neighborhoods, nan=0.0)
+    # Create distance mask (True for neighbors within threshold)
+    distance_mask_pca = knn_dists_pca <= pca_distance_threshold  # [N, k_pca+1]
     
-    # Center each neighborhood
-    centroids = all_neighborhoods.mean(dim=1, keepdim=True)  # [N, 1, 3]
-    centered = all_neighborhoods - centroids  # [N, k+1, 3]
+    # Count valid neighbors per point
+    valid_neighbor_counts = distance_mask_pca.sum(dim=1)  # [N]
+    min_neighbors = valid_neighbor_counts.min().item()
+    max_neighbors = valid_neighbor_counts.max().item()
+    mean_neighbors = valid_neighbor_counts.float().mean().item()
+    LOGGER.info(f"Valid PCA neighbors per point: min={min_neighbors}, max={max_neighbors}, mean={mean_neighbors:.1f}")
     
-    # Compute covariance matrices in batch: C = (1/k) * X^T * X
-    # For each point: cov = centered.T @ centered / k
-    cov_matrices = torch.bmm(centered.transpose(1, 2), centered) / (k_neighbors_pca + 1)  # [N, 3, 3]
+    # Warn if some points have very few neighbors
+    few_neighbors_mask = valid_neighbor_counts < 10
+    if few_neighbors_mask.any():
+        few_count = few_neighbors_mask.sum().item()
+        LOGGER.warning(f"{few_count} points have < 10 valid PCA neighbors (may have unstable normals)")
     
-    # Add small regularization to diagonal for numerical stability
-    eye_batch = torch.eye(3, device=device).unsqueeze(0).expand(N, -1, -1)  # [N, 3, 3]
-    cov_matrices = cov_matrices + 1e-6 * eye_batch
+    # Compute PCA per point (handling variable neighborhood sizes)
+    normals = torch.zeros((N, 3), device=device, dtype=torch.float32)
+    eigenvalues = torch.zeros((N, 3), device=device, dtype=torch.float32)
     
-    # Check for NaN/Inf in covariance matrices
-    if torch.isnan(cov_matrices).any() or torch.isinf(cov_matrices).any():
-        nan_count = torch.isnan(cov_matrices).sum().item()
-        inf_count = torch.isinf(cov_matrices).sum().item()
-        LOGGER.warning(f"Found {nan_count} NaN and {inf_count} Inf values in covariance matrices")
-        cov_matrices = torch.nan_to_num(cov_matrices, nan=0.0, posinf=1e6, neginf=-1e6)
+    # Process in batches to avoid OOM
+    batch_size = 10000
+    num_batches = (N + batch_size - 1) // batch_size
+    LOGGER.info(f"Processing PCA in {num_batches} batches of {batch_size} points...")
     
-    # Move to CPU for more robust eigenvalue decomposition (CUDA has numerical issues)
-    LOGGER.info("Performing eigenvalue decomposition on CPU for numerical stability...")
-    cov_matrices_cpu = cov_matrices.cpu().double()  # Use float64 for better stability
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, N)
+        batch_N = end_idx - start_idx
+        
+        if batch_idx % 10 == 0:
+            LOGGER.info(f"  Processing batch {batch_idx+1}/{num_batches} ({start_idx}-{end_idx})...")
+        
+        # Get neighborhoods for this batch
+        batch_knn_indices = knn_indices_pca[start_idx:end_idx]  # [batch_N, k_pca+1]
+        batch_distance_mask = distance_mask_pca[start_idx:end_idx]  # [batch_N, k_pca+1]
+        
+        # Process each point in batch individually (due to variable neighborhood sizes)
+        for i in range(batch_N):
+            point_idx = start_idx + i
+            
+            # Get valid neighbors (within distance threshold)
+            valid_mask = batch_distance_mask[i]  # [k_pca+1]
+            valid_indices = batch_knn_indices[i][valid_mask]  # [n_valid]
+            n_valid = len(valid_indices)
+            
+            if n_valid < 3:
+                # Not enough neighbors for PCA - assign zero normal and eigenvalues
+                # These will be filtered out by planarity threshold later
+                continue
+            
+            # Get neighborhood positions
+            neighborhood = means_3d[valid_indices]  # [n_valid, 3]
+            
+            # Check for NaN
+            if torch.isnan(neighborhood).any():
+                neighborhood = torch.nan_to_num(neighborhood, nan=0.0)
+            
+            # Center neighborhood
+            centroid = neighborhood.mean(dim=0, keepdim=True)  # [1, 3]
+            centered = neighborhood - centroid  # [n_valid, 3]
+            
+            # Compute covariance matrix
+            cov = (centered.T @ centered) / n_valid  # [3, 3]
+            
+            # Add regularization
+            cov = cov + 1e-6 * torch.eye(3, device=device)
+            
+            # Check for NaN/Inf
+            if torch.isnan(cov).any() or torch.isinf(cov).any():
+                cov = torch.nan_to_num(cov, nan=0.0, posinf=1e6, neginf=-1e6)
+            
+            # Eigendecomposition on CPU for stability
+            cov_cpu = cov.cpu().double()
+            eigvals_cpu, eigvecs_cpu = torch.linalg.eigh(cov_cpu)
+            
+            # Store results
+            eigenvalues[point_idx] = eigvals_cpu.to(device).float()
+            normals[point_idx] = eigvecs_cpu[:, 0].to(device).float()  # Smallest eigenvector
+        
+        # Free memory
+        if device.type == 'cuda':
+            torch.cuda.empty_cache()
     
-    # Batch eigenvalue decomposition on CPU
-    eigenvalues_cpu, eigenvectors_cpu = torch.linalg.eigh(cov_matrices_cpu)  # [N, 3], [N, 3, 3]
-    
-    # Move results back to GPU as float32
-    eigenvalues = eigenvalues_cpu.to(device).float()
-    eigenvectors = eigenvectors_cpu.to(device).float()
+    LOGGER.info("PCA computation complete")
     
     # Extract normals (eigenvector of smallest eigenvalue - first column)
     normals = eigenvectors[:, :, 0]  # [N, 3]
@@ -958,7 +1030,7 @@ def segment_gaussians_3d_bfs(
     normal_threshold = np.cos(np.deg2rad(normal_angle_threshold_deg))
     LOGGER.info(f"Normal angle threshold: {normal_angle_threshold_deg}° (cosine similarity > {normal_threshold:.4f})")
     
-    max_segments = 3  # Maximum number of segments to find
+    max_segments = 2  # Maximum number of segments to find
     min_segment_size = 10000  # Minimum segment size
     
     # BFS segmentation - Continue until no more valid seeds or max segments reached
