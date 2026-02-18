@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Multi-Camera Mesh Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      height: 100vh;
+      width: 100vw;
+      background: #1a1a1a;
+      margin: 0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    #sidebar {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 280px;
+      height: 100vh;
+      background: rgba(30, 30, 30, 0.95);
+      padding: 20px;
+      overflow-y: auto;
+      box-shadow: 2px 0 12px rgba(0,0,0,0.5);
+      z-index: 100;
+    }
+
+    #sidebar h2 {
+      margin-top: 0;
+      font-size: 1.2em;
+      border-bottom: 2px solid #4f8cff;
+      padding-bottom: 8px;
+      margin-bottom: 12px;
+    }
+
+    #sidebar select {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 16px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      border-radius: 6px;
+      font-size: 1em;
+      cursor: pointer;
+    }
+
+    #sidebar button {
+      width: 100%;
+      padding: 10px;
+      background: #4f8cff;
+      border: none;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1em;
+      margin-bottom: 16px;
+    }
+
+    #sidebar button:hover {
+      background: #3a7de8;
+    }
+
+    .checkbox-group {
+      margin: 16px 0;
+    }
+
+    .checkbox-item {
+      display: flex;
+      align-items: center;
+      margin: 8px 0;
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .checkbox-item input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      margin-right: 10px;
+      cursor: pointer;
+    }
+
+    .checkbox-item label {
+      cursor: pointer;
+      font-size: 0.95em;
+    }
+
+    #status {
+      padding: 10px;
+      margin-top: 10px;
+      background: #2a2a2a;
+      border-radius: 6px;
+      font-size: 0.85em;
+      color: #888;
+    }
+
+    #container {
+      position: fixed;
+      left: 280px;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #loading {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 1.5em;
+      color: #4f8cff;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="sidebar">
+    <h2>Folder Selection</h2>
+    <select id="folderSelect">
+      <option value="">Select a folder...</option>
+    </select>
+    <button id="loadBtn">Load Visualization</button>
+    
+    <h2>Display Options</h2>
+    <div class="checkbox-group">
+      <div class="checkbox-item">
+        <input type="checkbox" id="showMeshes" checked>
+        <label for="showMeshes">Show Meshes</label>
+      </div>
+      <div class="checkbox-item">
+        <input type="checkbox" id="showGS" checked>
+        <label for="showGS">Show Gaussian Splat</label>
+      </div>
+      <div class="checkbox-item">
+        <input type="checkbox" id="showCameras" checked>
+        <label for="showCameras">Show Camera Locations</label>
+      </div>
+    </div>
+    
+    <div id="status">Select a folder to begin</div>
+  </div>
+  
+  <div id="container"></div>
+  <div id="loading" style="display:none;">Loading...</div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    import { SplatMesh } from "@sparkjsdev/spark";
+    import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+
+    const container = document.getElementById('container');
+    const folderSelect = document.getElementById('folderSelect');
+    const loadBtn = document.getElementById('loadBtn');
+    const loading = document.getElementById('loading');
+    const status = document.getElementById('status');
+    
+    const showMeshesCheckbox = document.getElementById('showMeshes');
+    const showGSCheckbox = document.getElementById('showGS');
+    const showCamerasCheckbox = document.getElementById('showCameras');
+
+    let scene, camera, renderer, controls;
+    let meshGroup = new THREE.Group();
+    let splatMesh = null;
+    let cameraMarkersGroup = new THREE.Group();
+    let currentFolder = '';
+
+    // Fibonacci hemisphere generation (matching the Python implementation)
+    function fibonacci_hemisphere(n_points, upper = true) {
+      const phi = Math.PI * (3.0 - Math.sqrt(5.0)); // Golden angle
+      const points = [];
+      
+      for (let i = 0; i < n_points; i++) {
+        const y = 1 - (i / (n_points - 1)) * 2; // y from 1 to -1
+        const radius_at_y = Math.sqrt(1 - y * y);
+        const theta = phi * i;
+        
+        const x = Math.cos(theta) * radius_at_y;
+        const z = Math.sin(theta) * radius_at_y;
+        
+        // Filter by hemisphere
+        if ((upper && y >= 0) || (!upper && y <= 0)) {
+          points.push(new THREE.Vector3(x, y, z));
+        }
+      }
+      
+      return points;
+    }
+
+    // Generate camera positions
+    function generateCameraPositions() {
+      const n_cams = 30;
+      const radius = 3.0;
+      const lower_hemisphere = true;
+      
+      const unit_positions = fibonacci_hemisphere(n_cams, !lower_hemisphere);
+      const positions = unit_positions.map(p => p.multiplyScalar(radius));
+      
+      return positions;
+    }
+
+    // Initialize Three.js scene
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.01, 100);
+      camera.position.set(0, 0, 3);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+      scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(1, 1, 1);
+      scene.add(directionalLight);
+
+      // Add groups to scene
+      scene.add(meshGroup);
+      scene.add(cameraMarkersGroup);
+
+      // Animation loop
+      function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      animate();
+
+      // Handle window resize
+      window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+      });
+    }
+
+    // Load available folders
+    async function loadFolders() {
+      try {
+        const response = await fetch('/api/folders');
+        const data = await response.json();
+        
+        folderSelect.innerHTML = '<option value="">Select a folder...</option>';
+        data.folders.forEach(folder => {
+          const option = document.createElement('option');
+          option.value = folder;
+          option.textContent = folder;
+          folderSelect.appendChild(option);
+        });
+      } catch (error) {
+        console.error('Failed to load folders:', error);
+        status.textContent = 'Error loading folders';
+        status.style.color = '#f44';
+      }
+    }
+
+    // Clear current visualization
+    function clearScene() {
+      // Clear meshes
+      meshGroup.children.forEach(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) {
+          if (Array.isArray(child.material)) {
+            child.material.forEach(m => m.dispose());
+          } else {
+            child.material.dispose();
+          }
+        }
+      });
+      meshGroup.clear();
+      
+      // Clear splat
+      if (splatMesh) {
+        scene.remove(splatMesh);
+        splatMesh = null;
+      }
+      
+      // Clear camera markers
+      cameraMarkersGroup.children.forEach(child => {
+        if (child.geometry) child.geometry.dispose();
+        if (child.material) child.material.dispose();
+      });
+      cameraMarkersGroup.clear();
+    }
+
+    // Create camera location markers
+    function createCameraMarkers(positions) {
+      cameraMarkersGroup.clear();
+      
+      const geometry = new THREE.SphereGeometry(0.03, 16, 16);
+      const material = new THREE.MeshBasicMaterial({ color: 0x4f8cff });
+      
+      positions.forEach((pos, idx) => {
+        const marker = new THREE.Mesh(geometry, material);
+        marker.position.copy(pos);
+        cameraMarkersGroup.add(marker);
+        
+        // Add text label
+        const canvas = document.createElement('canvas');
+        canvas.width = 64;
+        canvas.height = 64;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 48px Arial';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText((idx + 1).toString(), 32, 32);
+        
+        const texture = new THREE.CanvasTexture(canvas);
+        const spriteMaterial = new THREE.SpriteMaterial({ map: texture });
+        const sprite = new THREE.Sprite(spriteMaterial);
+        sprite.scale.set(0.15, 0.15, 1);
+        sprite.position.copy(pos).add(new THREE.Vector3(0, 0.1, 0));
+        cameraMarkersGroup.add(sprite);
+      });
+    }
+
+    // Calculate mean position from indices
+    function getMeanPosition(positions, indices) {
+      const mean = new THREE.Vector3();
+      indices.forEach(idx => {
+        mean.add(positions[idx - 1]); // Convert 1-indexed to 0-indexed
+      });
+      mean.divideScalar(indices.length);
+      return mean;
+    }
+
+    // Calculate center of Gaussian Splat primitives
+    function getSplatCenter(splat) {
+      // Approximate center as the bounding box center
+      const box = new THREE.Box3().setFromObject(splat);
+      return box.getCenter(new THREE.Vector3());
+    }
+
+    // Load and visualize a folder
+    async function loadFolder(folder) {
+      if (!folder) {
+        status.textContent = 'Please select a folder';
+        status.style.color = '#f44';
+        return;
+      }
+
+      loading.style.display = 'block';
+      status.textContent = 'Loading...';
+      status.style.color = '#888';
+      clearScene();
+      currentFolder = folder;
+
+      try {
+        // Load mesh files
+        const response = await fetch(`/api/meshes/${encodeURIComponent(folder)}`);
+        const data = await response.json();
+        
+        if (data.meshes.length === 0) {
+          status.textContent = 'No mesh files found';
+          status.style.color = '#f44';
+          loading.style.display = 'none';
+          return;
+        }
+
+        // Load all meshes
+        const loader = new PLYLoader();
+        let loadedCount = 0;
+        
+        const loadPromises = data.meshes.map(filename => {
+          return new Promise((resolve, reject) => {
+            const url = `/output/${folder}/${filename}`;
+            loader.load(url, 
+              (geometry) => {
+                geometry.computeVertexNormals();
+                const material = new THREE.MeshStandardMaterial({ 
+                  vertexColors: true,
+                  side: THREE.DoubleSide
+                });
+                const mesh = new THREE.Mesh(geometry, material);
+                meshGroup.add(mesh);
+                loadedCount++;
+                status.textContent = `Loading meshes: ${loadedCount}/${data.meshes.length}`;
+                resolve();
+              },
+              undefined,
+              reject
+            );
+          });
+        });
+
+        await Promise.all(loadPromises);
+
+        // Load Gaussian Splat from ./splats/{folder}.ply
+        status.textContent = 'Loading Gaussian Splat...';
+        const splatUrl = `/splats/butterfly.ply`;
+        
+        try {
+          splatMesh = new SplatMesh({ url: splatUrl });
+          splatMesh.quaternion.set(0.7071, 0, 0, 0.7071);
+          splatMesh.position.set(0, 0, 0);
+          scene.add(splatMesh);
+          
+          // Wait a bit for splat to initialize
+          await new Promise(resolve => setTimeout(resolve, 500));
+          
+          // Get splat center
+          const splatCenter = getSplatCenter(splatMesh);
+          controls.target.copy(splatCenter);
+          
+          // Generate camera positions
+          const cameraPositions = generateCameraPositions();
+          
+          // Create camera markers
+          createCameraMarkers(cameraPositions);
+          
+          // Set initial camera position at mean of cam1, cam9, cam14
+          const initialCameraPos = getMeanPosition(cameraPositions, [1, 9, 14]);
+          camera.position.copy(initialCameraPos);
+          camera.lookAt(splatCenter);
+          controls.update();
+          
+          status.textContent = `Loaded ${data.meshes.length} meshes + GS`;
+          status.style.color = '#4f8cff';
+        } catch (error) {
+          console.warn('Failed to load Gaussian Splat:', error);
+          status.textContent = `Loaded ${data.meshes.length} meshes (no GS found)`;
+          status.style.color = '#ffa500';
+          
+          // Still generate camera positions and set initial camera
+          const cameraPositions = generateCameraPositions();
+          createCameraMarkers(cameraPositions);
+          
+          // Use origin as center if no splat
+          const center = new THREE.Vector3(0, 0, 0);
+          controls.target.copy(center);
+          
+          const initialCameraPos = getMeanPosition(cameraPositions, [1, 9, 14]);
+          camera.position.copy(initialCameraPos);
+          camera.lookAt(center);
+          controls.update();
+        }
+
+      } catch (error) {
+        console.error('Failed to load visualization:', error);
+        status.textContent = 'Error loading visualization';
+        status.style.color = '#f44';
+      } finally {
+        loading.style.display = 'none';
+      }
+    }
+
+    // Event listeners
+    loadBtn.onclick = () => {
+      const folder = folderSelect.value;
+      if (folder) {
+        loadFolder(folder);
+      }
+    };
+
+    showMeshesCheckbox.onchange = (e) => {
+      meshGroup.visible = e.target.checked;
+    };
+
+    showGSCheckbox.onchange = (e) => {
+      if (splatMesh) {
+        splatMesh.visible = e.target.checked;
+      }
+    };
+
+    showCamerasCheckbox.onchange = (e) => {
+      cameraMarkersGroup.visible = e.target.checked;
+    };
+
+    // Initialize
+    initScene();
+    loadFolders();
+
+    // Load folder from URL parameter if present
+    const params = new URLSearchParams(window.location.search);
+    const urlFolder = params.get('folder');
+    if (urlFolder) {
+      folderSelect.value = urlFolder;
+      loadFolder(urlFolder);
+    }
+  </script>
+</body>
+
+</html>

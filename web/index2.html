@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Mesh & GS Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      height: 100vh;
+      width: 100vw;
+      background: #1a1a1a;
+      margin: 0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    #sidebar {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 320px;
+      height: 100vh;
+      background: rgba(30, 30, 30, 0.95);
+      padding: 20px;
+      overflow-y: auto;
+      box-shadow: 2px 0 12px rgba(0,0,0,0.5);
+      z-index: 100;
+    }
+
+    #sidebar h2 {
+      margin-top: 0;
+      font-size: 1.3em;
+      border-bottom: 2px solid #4f8cff;
+      padding-bottom: 8px;
+    }
+
+    #sidebar input[type="text"] {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      border-radius: 6px;
+      font-size: 1em;
+    }
+
+    #sidebar button {
+      width: 100%;
+      padding: 10px;
+      background: #4f8cff;
+      border: none;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1em;
+      margin-bottom: 16px;
+    }
+
+    #sidebar button:hover {
+      background: #3a7de8;
+    }
+
+    #folderList {
+      margin-bottom: 20px;
+    }
+
+    .folder-item {
+      padding: 8px;
+      margin: 4px 0;
+      background: #2a2a2a;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.9em;
+      transition: background 0.2s;
+    }
+
+    .folder-item:hover {
+      background: #3a3a3a;
+    }
+
+    .folder-item.active {
+      background: #4f8cff;
+    }
+
+    #fileList {
+      margin-top: 20px;
+    }
+
+    .file-item {
+      padding: 10px;
+      margin: 6px 0;
+      background: #2a2a2a;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .file-item:hover {
+      background: #3a3a3a;
+    }
+
+    .file-item.active {
+      background: #4f8cff;
+    }
+
+    .file-type {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 0.8em;
+      margin-left: 8px;
+    }
+
+    .file-type.gs {
+      background: #28a745;
+    }
+
+    .file-type.mesh {
+      background: #ff6b35;
+    }
+
+    #container {
+      position: fixed;
+      left: 320px;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #loading {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 1.5em;
+      color: #4f8cff;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="sidebar">
+    <h2>Folder</h2>
+    <input type="text" id="folderInput" placeholder="Enter folder name...">
+    <button id="loadFolderBtn">Load Folder</button>
+    
+    <h2>Recent Folders</h2>
+    <div id="folderList"></div>
+    
+    <h2>Files</h2>
+    <div id="fileList"></div>
+  </div>
+  
+  <div id="container"></div>
+  <div id="loading" style="display:none;">Loading...</div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    import { SplatMesh } from "@sparkjsdev/spark";
+    import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+
+    const container = document.getElementById('container');
+    const folderInput = document.getElementById('folderInput');
+    const loadFolderBtn = document.getElementById('loadFolderBtn');
+    const folderList = document.getElementById('folderList');
+    const fileList = document.getElementById('fileList');
+    const loading = document.getElementById('loading');
+
+    let scene, camera, renderer, controls;
+    let currentMesh = null;
+    let currentSplat = null;
+    let currentFolder = '';
+
+    // Initialize Three.js scene
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
+      camera.position.z = 2;
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(1, 1, 1);
+      scene.add(directionalLight);
+
+      // Animation loop
+      function animate() {
+        requestAnimationFrame(animate);
+        controls.update();
+        renderer.render(scene, camera);
+      }
+      animate();
+
+      // Handle window resize
+      window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+      });
+    }
+
+    // Load available folders
+    async function loadFolders() {
+      try {
+        const response = await fetch('/api/folders');
+        const data = await response.json();
+        
+        folderList.innerHTML = '';
+        data.folders.forEach(folder => {
+          const div = document.createElement('div');
+          div.className = 'folder-item';
+          div.textContent = folder;
+          div.onclick = () => loadFolder(folder);
+          folderList.appendChild(div);
+        });
+      } catch (error) {
+        console.error('Failed to load folders:', error);
+      }
+    }
+
+    // Load files from a specific folder
+    async function loadFolder(folder) {
+      currentFolder = folder;
+      folderInput.value = folder;
+      
+      // Update active state
+      document.querySelectorAll('.folder-item').forEach(el => {
+        el.classList.toggle('active', el.textContent === folder);
+      });
+
+      try {
+        const response = await fetch(`/api/files/${encodeURIComponent(folder)}`);
+        const data = await response.json();
+        
+        fileList.innerHTML = '';
+        
+        if (data.files.length === 0) {
+          fileList.innerHTML = '<div style="padding:10px;color:#888;">No files found</div>';
+          return;
+        }
+
+        data.files.forEach(file => {
+          const div = document.createElement('div');
+          div.className = 'file-item';
+          
+          const nameSpan = document.createElement('span');
+          nameSpan.textContent = file.name;
+          div.appendChild(nameSpan);
+          
+          const typeSpan = document.createElement('span');
+          typeSpan.className = `file-type ${file.type}`;
+          typeSpan.textContent = file.type.toUpperCase();
+          div.appendChild(typeSpan);
+          
+          div.onclick = () => loadFile(folder, file.name, file.type);
+          fileList.appendChild(div);
+        });
+      } catch (error) {
+        console.error('Failed to load files:', error);
+        fileList.innerHTML = '<div style="padding:10px;color:#f44;">Error loading files</div>';
+      }
+    }
+
+    // Clear current visualization
+    function clearScene() {
+      if (currentMesh) {
+        scene.remove(currentMesh);
+        if (currentMesh.geometry) currentMesh.geometry.dispose();
+        if (currentMesh.material) {
+          if (Array.isArray(currentMesh.material)) {
+            currentMesh.material.forEach(m => m.dispose());
+          } else {
+            currentMesh.material.dispose();
+          }
+        }
+        currentMesh = null;
+      }
+      
+      if (currentSplat) {
+        scene.remove(currentSplat);
+        currentSplat = null;
+      }
+    }
+
+    // Load and visualize a file
+    async function loadFile(folder, filename, type) {
+      loading.style.display = 'block';
+      clearScene();
+      
+      // Update active state
+      document.querySelectorAll('.file-item').forEach(el => {
+        el.classList.toggle('active', el.querySelector('span').textContent === filename);
+      });
+
+      const url = `/output/${folder}/${filename}`;
+
+      try {
+        if (type === 'gs') {
+          // Load Gaussian Splat
+          currentSplat = new SplatMesh({ url });
+          currentSplat.quaternion.set(1, 0, 0, 0);
+          currentSplat.position.set(0, 0, 0);
+          scene.add(currentSplat);
+        } else {
+          // Load PLY mesh
+          const loader = new PLYLoader();
+          loader.load(url, function (geometry) {
+            geometry.computeVertexNormals();
+            const material = new THREE.MeshStandardMaterial({ 
+              vertexColors: true,
+              side: THREE.DoubleSide
+            });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.quaternion.set(1, 0, 0, 0);
+            mesh.position.set(0, 0, 0);
+            scene.add(mesh);
+            currentMesh = mesh;
+            
+            // Center camera on mesh
+            const box = new THREE.Box3().setFromObject(mesh);
+            const center = box.getCenter(new THREE.Vector3());
+            const size = box.getSize(new THREE.Vector3());
+            const maxDim = Math.max(size.x, size.y, size.z);
+            const fov = camera.fov * (Math.PI / 180);
+            let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
+            cameraZ *= 1.5; // Zoom out a bit
+            camera.position.set(center.x, center.y, center.z + cameraZ);
+            controls.target.copy(center);
+            controls.update();
+          });
+        }
+      } catch (error) {
+        console.error('Failed to load file:', error);
+        alert('Failed to load file: ' + error.message);
+      } finally {
+        loading.style.display = 'none';
+      }
+    }
+
+    // Event listeners
+    loadFolderBtn.onclick = () => {
+      const folder = folderInput.value.trim();
+      if (folder) {
+        loadFolder(folder);
+      }
+    };
+
+    folderInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        loadFolderBtn.click();
+      }
+    });
+
+    // Initialize
+    initScene();
+    loadFolders();
+
+    // Load folder from URL parameter if present
+    const params = new URLSearchParams(window.location.search);
+    const urlFolder = params.get('folder');
+    if (urlFolder) {
+      loadFolder(urlFolder);
+    }
+  </script>
+</body>
+
+</html>

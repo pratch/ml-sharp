@@ -45,6 +45,59 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_MODEL_URL = "https://ml-site.cdn-apple.com/models/sharp/sharp_2572gikvuh.pt"
 
 
+def fibonacci_hemisphere(n_points, upper=True):
+    """
+    Generate evenly distributed points on hemisphere using Fibonacci lattice.
+    
+    Args:
+        n_points: number of points to generate
+        upper: if True, upper hemisphere (y >= 0); if False, lower hemisphere (y <= 0)
+    
+    Returns:
+        Array of shape [n_points, 3] containing unit vectors on hemisphere
+    """
+    points = []
+    phi = np.pi * (3.0 - np.sqrt(5.0))  # Golden angle in radians
+    
+    i = 0
+    while len(points) < n_points:
+        y = 1 - (i / (2 * n_points - 1)) * 2  # y from 1 to -1
+        
+        if (upper and y >= 0) or (not upper and y <= 0):
+            radius_at_y = np.sqrt(1 - y * y)
+            theta = phi * i
+            
+            x = np.cos(theta) * radius_at_y
+            z = np.sin(theta) * radius_at_y
+            
+            points.append([x, y, z])
+        
+        i += 1
+        
+        if i > 10 * n_points:
+            LOGGER.warning(f"Could only generate {len(points)} points on hemisphere, needed {n_points}")
+            break
+    
+    return np.array(points[:n_points], dtype=np.float32)
+
+
+def cartesian_to_spherical(points):
+    """
+    Convert Cartesian coordinates to spherical coordinates.
+    
+    Args:
+        points: [N, 3] array of (x, y, z) unit vectors
+    
+    Returns:
+        elevation: [N] array of elevation angles in degrees
+        azimuth: [N] array of azimuth angles in degrees
+    """
+    x, y, z = points[:, 0], points[:, 1], points[:, 2]
+    elev = np.arcsin(np.clip(y, -1.0, 1.0))
+    azim = np.arctan2(x, z)
+    return np.rad2deg(elev), np.rad2deg(azim)
+
+
 def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, up=None):
     """
     PyTorch3D-style look_at_view_transform function.
@@ -184,6 +237,30 @@ def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, 
     default=False,
     help="Use opacity-weighted PCA for normal estimation (default: enabled).",
 )
+@click.option(
+    "--n-cams",
+    type=int,
+    default=50,
+    help="Total number of camera viewpoints to generate using Fibonacci lattice (default: 50).",
+)
+@click.option(
+    "--cam-indices",
+    type=str,
+    default=None,
+    help="Comma-separated camera indices to process (e.g., '1,5,10'). If not provided, processes all cameras.",
+)
+@click.option(
+    "--radius",
+    type=float,
+    default=3.0,
+    help="Radius of hemisphere (distance from object center) in meters (default: 3.0).",
+)
+@click.option(
+    "--lower-hemisphere",
+    is_flag=True,
+    default=False,
+    help="Use lower hemisphere (y <= 0) instead of upper hemisphere (default: False).",
+)
 def predict_cli(
     input_path: Path,
     output_path: Path,
@@ -193,6 +270,10 @@ def predict_cli(
     verbose: bool,
     object_filter: str,
     use_weighted_pca: bool,
+    n_cams: int,
+    cam_indices: str,
+    radius: float,
+    lower_hemisphere: bool,
 ):
     # Initialize logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -226,9 +307,21 @@ def predict_cli(
     LOGGER.info(f"verbose: {verbose}")
     LOGGER.info(f"object_filter: {object_filter}")
     LOGGER.info(f"use_weighted_pca: {use_weighted_pca}")
+    LOGGER.info(f"n_cams: {n_cams}")
+    LOGGER.info(f"cam_indices: {cam_indices}")
+    LOGGER.info(f"radius: {radius}")
+    LOGGER.info(f"lower_hemisphere: {lower_hemisphere}")
     LOGGER.info("========================")
     
     device = torch.device("cuda")
+    
+    # Parse camera indices
+    if cam_indices is not None:
+        selected_cam_indices = [int(idx.strip()) for idx in cam_indices.split(',')]
+        LOGGER.info(f"Processing camera indices: {selected_cam_indices}")
+    else:
+        selected_cam_indices = list(range(1, n_cams + 1))  # 1-indexed
+        LOGGER.info(f"Processing all {n_cams} cameras")
 
     extensions = io.get_supported_image_extensions()
     image_paths = []
@@ -288,82 +381,76 @@ def predict_cli(
         LOGGER.info(f"Gaussian std: {std_pos}")
         LOGGER.info(f"Gaussian bbox: min={bbox_min}, max={bbox_max}")
         
-        # PyTorch3D-style camera setup using spherical coordinates
-        # For butterfly at y=offset with wings in X-Z plane, use Z as up
-        ext_id = look_at_view_transform(
-            dist=3.0,           # Distance from object
-            elev=0.0,           # Elevation angle in degrees
-            azim=90.0,          # Rotate 90° to look along -Y axis
-            at=mean_pos,        # Look at object center
-            up=[0.0, 1.0, 0.0]  # Y is up for butterfly
-        )
+        # Generate camera positions using Fibonacci lattice
+        hemisphere_type = "lower" if lower_hemisphere else "upper"
+        LOGGER.info(f"Generating {n_cams} camera positions on {hemisphere_type} hemisphere (radius={radius}m)...")
+        unit_vectors = fibonacci_hemisphere(n_cams, upper=not lower_hemisphere)
+        elevations, azimuths = cartesian_to_spherical(unit_vectors)
+        camera_positions = unit_vectors * radius + mean_pos
         
-        # Option 2: For mlsharp at z=offset (uncomment to use):
-        # ext_id = look_at_view_transform(
-        #     dist=3.0,
-        #     elev=0.0,
-        #     azim=0.0,
-        #     at=mean_pos,
-        #     up=[0.0, 1.0, 0.0]  # Y is up
-        # )
+        LOGGER.info(f"Elevation range: [{elevations.min():.1f}°, {elevations.max():.1f}°]")
+        LOGGER.info(f"Azimuth range: [{azimuths.min():.1f}°, {azimuths.max():.1f}°]")
         
-        # Debug: compute and log actual camera position
-        cam_x = 3.0 * np.cos(np.deg2rad(0.0)) * np.sin(np.deg2rad(90.0)) + mean_pos[0]
-        cam_y = 3.0 * np.sin(np.deg2rad(0.0)) + mean_pos[1]
-        cam_z = 3.0 * np.cos(np.deg2rad(0.0)) * np.cos(np.deg2rad(90.0)) + mean_pos[2]
-        LOGGER.info(f"Camera position: [{cam_x:.3f}, {cam_y:.3f}, {cam_z:.3f}]")
-        LOGGER.info(f"Camera looking at: {mean_pos}")
-        LOGGER.info(f"Camera up vector: [0, 0, 1]")
-        LOGGER.info(f"Extrinsics matrix:\n{ext_id[0]}")
-        
-        # Debug: Transform some Gaussians to camera space to check if they're visible
-        gs_means_homo = np.concatenate([gs_means, np.ones((len(gs_means), 1))], axis=1)  # [N, 4]
-        ext_np = ext_id[0].numpy()
-        gs_means_cam = (ext_np @ gs_means_homo.T).T  # [N, 4]
-        depths_cam = gs_means_cam[:, 2]  # Z coordinate in camera space
-        LOGGER.info(f"Gaussians in camera space - Z (depth) stats: min={depths_cam.min():.3f}, max={depths_cam.max():.3f}, mean={depths_cam.mean():.3f}")
-        LOGGER.info(f"Number of Gaussians with positive depth (in front): {(depths_cam > 0).sum()} / {len(depths_cam)}")
-
-        # Setup renderer for mesh generation
+        # Setup renderer
         renderer = gsplat.GSplatRenderer(color_space="linear")
         
-        # Single view rendering for mesh generation
-        ext_id = look_at_view_transform(
-            dist=3.0,
-            elev=0.0,
-            azim=-50.0, # -50.0,  # Adjust azimuth as needed for mesh generation (try -50, -35, -20)
-            at=mean_pos,
-            up=[0.0, 1.0, 0.0]
-        )
-        
-        rendering_output = renderer(
-            gaussians.to(device),
-            extrinsics=ext_id.to(device),
-            intrinsics=intrinsics[None],
-            image_width=width,
-            image_height=height,
-        )
+        # Process each selected camera
+        for cam_idx in selected_cam_indices:
+            if cam_idx < 1 or cam_idx > n_cams:
+                LOGGER.warning(f"Camera index {cam_idx} out of range [1, {n_cams}], skipping")
+                continue
+            
+            # Convert to 0-indexed
+            cam_i = cam_idx - 1
+            
+            # Get camera parameters
+            elev = elevations[cam_i]
+            azim = azimuths[cam_i]
+            cam_pos = camera_positions[cam_i]
+            
+            LOGGER.info(f"\n{'='*60}")
+            LOGGER.info(f"Processing Camera {cam_idx}/{n_cams}")
+            LOGGER.info(f"Position: [{cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f}]")
+            LOGGER.info(f"Elevation: {elev:.1f}°, Azimuth: {azim:.1f}°")
+            LOGGER.info(f"{'='*60}\n")
+            
+            # Generate camera extrinsics
+            ext_id = look_at_view_transform(
+                dist=radius,
+                elev=elev,
+                azim=azim,
+                at=mean_pos,
+                up=[0.0, 1.0, 0.0]
+            )
+            
+            rendering_output = renderer(
+                gaussians.to(device),
+                extrinsics=ext_id.to(device),
+                intrinsics=intrinsics[None],
+                image_width=width,
+                image_height=height,
+            )
 
-        # Extract depth and color
-        depth = rendering_output.depth[0]
-        depth_np = depth.cpu().numpy()
-        color = torch.clamp(rendering_output.color[0], 0.0, 1.0)
-        color = (color.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
-        color = color.cpu().numpy()
+            # Extract depth and color
+            depth = rendering_output.depth[0]
+            depth_np = depth.cpu().numpy()
+            color = torch.clamp(rendering_output.color[0], 0.0, 1.0)
+            color = (color.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+            color = color.cpu().numpy()
+            
+            LOGGER.info(f"Depth stats: shape={depth_np.shape}, min={depth_np.min():.3f}, max={depth_np.max():.3f}")
+            
+            # Save rendered view
+            io.save_image(color, output_path / f"{image_path.stem}_cam{cam_idx:02d}_rendered.png")
         
-        LOGGER.info(f"Depth stats: shape={depth_np.shape}, min={depth_np.min():.3f}, max={depth_np.max():.3f}")
-        
-        # Save rendered view
-        io.save_image(color, output_path / f"{image_path.stem}_rendered.png")
-        
-        # Save depth visualization (same as predict_with_info.py)
-        colored_depth_pt = vis.colorize_depth(
-            depth,
-            min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),
-        )
-        colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
-        io.save_image(colored_depth_np, output_path / f"{image_path.stem}_rawdepth.png")
-        LOGGER.info(f"Saved depth visualization to {output_path / f'{image_path.stem}_rawdepth.png'}")
+            # Save depth visualization
+            colored_depth_pt = vis.colorize_depth(
+                depth,
+                min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),
+            )
+            colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            io.save_image(colored_depth_np, output_path / f"{image_path.stem}_cam{cam_idx:02d}_rawdepth.png")
+            LOGGER.info(f"Saved depth visualization to {output_path / f'{image_path.stem}_cam{cam_idx:02d}_rawdepth.png'}")
 
         # Compute and render normal map
         quats = gaussians.quaternions[0].to(device)  # [N, 4]
@@ -404,82 +491,181 @@ def predict_cli(
             opacities=gaussians.opacities,
         )
         
-        # Save gaussians with normals as colors (move to CPU first)
-        save_ply(gaussians_with_normals.to("cpu"), f_px, (height, width), output_path / f"{image_path.stem}_normals_gs.ply")
-        LOGGER.info(f"Saved normal Gaussians to {output_path / f'{image_path.stem}_normals_gs.ply'}")
-        
-        normal_rendering = renderer(
-            gaussians_with_normals.to(device),
-            extrinsics=ext_id.to(device),
-            intrinsics=intrinsics[None],
-            image_width=width,
-            image_height=height,
-        )
-        
-        normal_map = (normal_rendering.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
-        normal_map = normal_map.cpu().numpy()
-        io.save_image(normal_map, output_path / f"{image_path.stem}_normals.png")
-        LOGGER.info(f"Saved normal map to {output_path / f'{image_path.stem}_normals.png'}")
+        # Process each selected camera
+        for cam_idx in selected_cam_indices:
+            if cam_idx < 1 or cam_idx > n_cams:
+                LOGGER.warning(f"Camera index {cam_idx} out of range [1, {n_cams}], skipping")
+                continue
+            
+            # Convert to 0-indexed
+            cam_i = cam_idx - 1
+            
+            # Get camera parameters
+            elev = elevations[cam_i]
+            azim = azimuths[cam_i]
+            cam_pos = camera_positions[cam_i]
+            
+            LOGGER.info(f"\n{'='*60}")
+            LOGGER.info(f"Processing Camera {cam_idx}/{n_cams}")
+            LOGGER.info(f"Position: [{cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f}]")
+            LOGGER.info(f"Elevation: {elev:.1f}°, Azimuth: {azim:.1f}°")
+            LOGGER.info(f"{'='*60}\n")
+            
+            # Generate camera extrinsics
+            ext_id = look_at_view_transform(
+                dist=radius,
+                elev=elev,
+                azim=azim,
+                at=mean_pos,
+                up=[0.0, 1.0, 0.0]
+            )
+            
+            rendering_output = renderer(
+                gaussians.to(device),
+                extrinsics=ext_id.to(device),
+                intrinsics=intrinsics[None],
+                image_width=width,
+                image_height=height,
+            )
 
-        # Apply gaussian blur to the depth (squeeze to 2D first)
-        depth_2d = depth_np.squeeze()  # Remove singleton dimensions
-        depth_blurred = cv.GaussianBlur(depth_2d, (5, 5), 0)
-        depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
-        depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
+            # Extract depth and color
+            depth = rendering_output.depth[0]
+            depth_np = depth.cpu().numpy()
+            color = torch.clamp(rendering_output.color[0], 0.0, 1.0)
+            color = (color.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+            color = color.cpu().numpy()
+            
+            LOGGER.info(f"Depth stats: shape={depth_np.shape}, min={depth_np.min():.3f}, max={depth_np.max():.3f}")
+            
+            # Save rendered view
+            io.save_image(color, output_path / f"{image_path.stem}_cam{cam_idx:02d}_rendered.png")
+            
+            # Save depth visualization
+            colored_depth_pt = vis.colorize_depth(
+                depth,
+                min(depth_np.max(), vis.METRIC_DEPTH_MAX_CLAMP_METER),
+            )
+            colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
+            io.save_image(colored_depth_np, output_path / f"{image_path.stem}_cam{cam_idx:02d}_rawdepth.png")
+            LOGGER.info(f"Saved depth visualization to {output_path / f'{image_path.stem}_cam{cam_idx:02d}_rawdepth.png'}")
 
-        h, w = depth_2d.shape[0], depth_2d.shape[1]
-        f_x = intrinsics[0, 0].item()
-        f_y = intrinsics[1, 1].item()
-        c_x = intrinsics[0, 2].item()
-        c_y = intrinsics[1, 2].item()
+            # Compute and render normal map
+            quats = gaussians.quaternions[0].to(device)  # [N, 4]
+            scales = gaussians.singular_values[0].to(device)  # [N, 3]
+            w, x, y, z = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
+            
+            # Rotation matrix from quaternion
+            R = torch.stack([
+                torch.stack([1 - 2*(y**2 + z**2), 2*(x*y - w*z), 2*(x*z + w*y)], dim=-1),
+                torch.stack([2*(x*y + w*z), 1 - 2*(x**2 + z**2), 2*(y*z - w*x)], dim=-1),
+                torch.stack([2*(x*z - w*y), 2*(y*z + w*x), 1 - 2*(x**2 + y**2)], dim=-1),
+            ], dim=-2)  # [N, 3, 3]
+            
+            # Find the axis with smallest scale (the normal direction for flat Gaussians)
+            min_scale_idx = torch.argmin(scales, dim=1)  # [N]
+            
+            # Extract the corresponding column from rotation matrix
+            normals = torch.zeros((R.shape[0], 3), device=device)
+            for i in range(3):
+                mask = (min_scale_idx == i)
+                normals[mask] = R[mask, :, i]
 
-        # Segment Gaussians in 3D using BFS with PCA-based geometry
-        # PCA normals will be saved inside the function before BFS starts
-        # Segments will be processed and rendered as they are found
-        segments, pca_normals = segment_gaussians_3d_bfs(
-            gaussians,
-            device,
-            k_neighbors_pca=750,  # Large k for stable PCA normal estimation
-            k_neighbors_bfs=100,   # Smaller k for fast BFS traversal
-            normal_angle_threshold_deg=30.0,  # 30° angle threshold (relaxed from 15°)
-            distance_threshold=0.5,  # meters (for BFS traversal)
-            pca_distance_threshold=0.3,  # meters (max distance for PCA neighbors)
-            color_threshold=0.8,  # normalized color difference (relaxed from 0.5)
-            planarity_threshold=0.6,  # Westin's planarity > 0.7 for planar surfaces
-            use_weighted_pca=use_weighted_pca,  # Toggle opacity-weighted PCA
-            # Visualization and rendering parameters
-            extrinsics=ext_id,
-            intrinsics=intrinsics,
-            color_image=color,
-            renderer=renderer,
-            output_path=output_path,
-            image_stem=image_path.stem,
-        )
+            # force random normals for testing
+            # normals = torch.randn_like(normals)
+            
+            normals = F.normalize(normals, dim=-1)
+            
+            # Log scale statistics for debugging
+            LOGGER.info(f"Scale statistics: min={scales.min().item():.6f}, max={scales.max().item():.6f}, mean={scales.mean().item():.6f}")
+            LOGGER.info(f"Scale ratios (max/min per Gaussian): mean={((scales.max(dim=1)[0] / (scales.min(dim=1)[0] + 1e-8)).mean().item()):.2f}")
+            
+            # Create a copy of gaussians with normals as colors for rendering
+            gaussians_with_normals = Gaussians3D(
+                mean_vectors=gaussians.mean_vectors,
+                singular_values=gaussians.singular_values,
+                quaternions=gaussians.quaternions,
+                colors=((normals + 1.0) / 2.0).cpu().unsqueeze(0),  # Map [-1,1] to [0,1] for visualization
+                opacities=gaussians.opacities,
+            )
+            
+            # Save gaussians with normals as colors (move to CPU first)
+            save_ply(gaussians_with_normals.to("cpu"), f_px, (height, width), output_path / f"{image_path.stem}_cam{cam_idx:02d}_normals_gs.ply")
+            LOGGER.info(f"Saved normal Gaussians to {output_path / f'{image_path.stem}_cam{cam_idx:02d}_normals_gs.ply'}")
+            
+            normal_rendering = renderer(
+                gaussians_with_normals.to(device),
+                extrinsics=ext_id.to(device),
+                intrinsics=intrinsics[None],
+                image_width=width,
+                image_height=height,
+            )
+            
+            normal_map = (normal_rendering.color[0].permute(1, 2, 0) * 255.0).to(dtype=torch.uint8)
+            normal_map = normal_map.cpu().numpy()
+            io.save_image(normal_map, output_path / f"{image_path.stem}_cam{cam_idx:02d}_normals.png")
+            LOGGER.info(f"Saved normal map to {output_path / f'{image_path.stem}_cam{cam_idx:02d}_normals.png'}")
 
-        # After processing all segments, create a combined pruned Gaussians file
-        # Remove Gaussians that belong to any segment
-        gaussian_means_3d = gaussians.mean_vectors[0].cpu().numpy()
-        keep_gaussian = np.ones(len(gaussian_means_3d), dtype=bool)
-        
-        # Mark all segmented Gaussians for removal
-        all_segment_indices = []
-        for segment in segments:
-            all_segment_indices.extend(segment)
-        
-        for idx in all_segment_indices:
-            keep_gaussian[idx] = False
+            # Apply gaussian blur to the depth (squeeze to 2D first)
+            depth_2d = depth_np.squeeze()  # Remove singleton dimensions
+            depth_blurred = cv.GaussianBlur(depth_2d, (5, 5), 0)
+            depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
+            depth_blurred = cv.GaussianBlur(depth_blurred, (5, 5), 0)
 
-        # Create new Gaussians3D object with filtered Gaussians
-        flag = torch.from_numpy(keep_gaussian).to("cpu")
-        new_gaussians = Gaussians3D(
-            mean_vectors=gaussians.mean_vectors[0][flag][None],
-            singular_values=gaussians.singular_values[0][flag][None],
-            quaternions=gaussians.quaternions[0][flag][None],
-            colors=gaussians.colors[0][flag][None],
-            opacities=gaussians.opacities[0][flag][None],
-        )
-        save_ply(new_gaussians, f_px, (height, width), mesh_pruned_output_path)
-        LOGGER.info(f"Filtered Gaussians: {len(gaussian_means_3d) - len(new_gaussians.mean_vectors[0])} removed, {len(new_gaussians.mean_vectors[0])} remaining.")
+            h, w = depth_2d.shape[0], depth_2d.shape[1]
+            f_x = intrinsics[0, 0].item()
+            f_y = intrinsics[1, 1].item()
+            c_x = intrinsics[0, 2].item()
+            c_y = intrinsics[1, 2].item()
+
+            # Segment Gaussians in 3D using BFS with PCA-based geometry
+            # PCA normals will be saved inside the function before BFS starts
+            # Segments will be processed and rendered as they are found
+            segments, pca_normals = segment_gaussians_3d_bfs(
+                gaussians,
+                device,
+                k_neighbors_pca=750,  # Large k for stable PCA normal estimation
+                k_neighbors_bfs=100,   # Smaller k for fast BFS traversal
+                normal_angle_threshold_deg=30.0,  # 30° angle threshold (relaxed from 15°)
+                distance_threshold=0.5,  # meters (for BFS traversal)
+                pca_distance_threshold=0.3,  # meters (max distance for PCA neighbors)
+                color_threshold=0.8,  # normalized color difference (relaxed from 0.5)
+                planarity_threshold=0.6,  # Westin's planarity > 0.7 for planar surfaces
+                use_weighted_pca=use_weighted_pca,  # Toggle opacity-weighted PCA
+                # Visualization and rendering parameters
+                extrinsics=ext_id,
+                intrinsics=intrinsics,
+                color_image=color,
+                renderer=renderer,
+                output_path=output_path,
+                image_stem=f"{image_path.stem}_cam{cam_idx:02d}",
+                cam_idx=cam_idx,
+            )
+
+            # After processing all segments for this camera, create a combined pruned Gaussians file
+            # Remove Gaussians that belong to any segment
+            gaussian_means_3d = gaussians.mean_vectors[0].cpu().numpy()
+            keep_gaussian = np.ones(len(gaussian_means_3d), dtype=bool)
+            
+            # Mark all segmented Gaussians for removal
+            all_segment_indices = []
+            for segment in segments:
+                all_segment_indices.extend(segment)
+            
+            for idx in all_segment_indices:
+                keep_gaussian[idx] = False
+
+            # Create new Gaussians3D object with filtered Gaussians
+            flag = torch.from_numpy(keep_gaussian).to("cpu")
+            new_gaussians = Gaussians3D(
+                mean_vectors=gaussians.mean_vectors[0][flag][None],
+                singular_values=gaussians.singular_values[0][flag][None],
+                quaternions=gaussians.quaternions[0][flag][None],
+                colors=gaussians.colors[0][flag][None],
+                opacities=gaussians.opacities[0][flag][None],
+            )
+            cam_pruned_output_path = output_path / f"{image_path.stem}_cam{cam_idx:02d}_pruned.ply"
+            save_ply(new_gaussians, f_px, (height, width), cam_pruned_output_path)
+            LOGGER.info(f"Camera {cam_idx}: Filtered Gaussians: {len(gaussian_means_3d) - len(new_gaussians.mean_vectors[0])} removed, {len(new_gaussians.mean_vectors[0])} remaining.")
 
 
 def save_depth(depth_np, name):
@@ -507,6 +693,7 @@ def process_segment_mesh(
     color_image,
     output_path,
     image_stem,
+    cam_idx=None,
 ):
     """Process a segment: render visualizations and create mesh."""
     LOGGER.info(f"Processing segment {seg_idx} with {len(segment_indices)} Gaussians")
@@ -821,6 +1008,7 @@ def segment_gaussians_3d_bfs(
     renderer=None,  # For rendering segments
     output_path=None,
     image_stem=None,
+    cam_idx=None,
 ):
     """
     Segment Gaussian Splats in 3D using BFS traversal with PCA-based geometry estimation.
@@ -1226,6 +1414,7 @@ def segment_gaussians_3d_bfs(
                     color_image=color_image,
                     output_path=output_path,
                     image_stem=image_stem,
+                    cam_idx=cam_idx,
                 )
         else:
             LOGGER.warning(f"Segment {seg_num} too small ({len(segment)} < {min_segment_size}), not added")
