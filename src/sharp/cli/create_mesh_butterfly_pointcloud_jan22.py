@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from datetime import datetime
 
 import click
 import numpy as np
@@ -176,6 +177,13 @@ def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, 
     default=None,
     help="Filter images by object name (e.g., 'butterfly'). If not provided, processes all images.",
 )
+@click.option(
+    "--weighted-pca/--no-weighted-pca",
+    "use_weighted_pca",
+    is_flag=True,
+    default=False,
+    help="Use opacity-weighted PCA for normal estimation (default: enabled).",
+)
 def predict_cli(
     input_path: Path,
     output_path: Path,
@@ -184,6 +192,7 @@ def predict_cli(
     device: str,
     verbose: bool,
     object_filter: str,
+    use_weighted_pca: bool,
 ):
     # Initialize logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -195,7 +204,29 @@ def predict_cli(
     
     # Create output directory if it doesn't exist
     output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Add file handler to save logs to file
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = output_path / f"{timestamp}.log"
+    file_handler = logging.FileHandler(log_file, mode='w')
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s"))
+    logging.getLogger().addHandler(file_handler)
+    
     LOGGER.info(f"Output directory: {output_path}")
+    LOGGER.info(f"Logging to file: {log_file}")
+    
+    # Log all CLI flags
+    LOGGER.info("=== CLI Configuration ===")
+    LOGGER.info(f"input_path: {input_path}")
+    LOGGER.info(f"output_path: {output_path}")
+    LOGGER.info(f"checkpoint_path: {checkpoint_path}")
+    LOGGER.info(f"with_rendering: {with_rendering}")
+    LOGGER.info(f"device: {device}")
+    LOGGER.info(f"verbose: {verbose}")
+    LOGGER.info(f"object_filter: {object_filter}")
+    LOGGER.info(f"use_weighted_pca: {use_weighted_pca}")
+    LOGGER.info("========================")
     
     device = torch.device("cuda")
 
@@ -300,7 +331,7 @@ def predict_cli(
         ext_id = look_at_view_transform(
             dist=3.0,
             elev=0.0,
-            azim=-20.0, # -50.0,  # Adjust azimuth as needed for mesh generation (try -50, -35, -20)
+            azim=-50.0, # -50.0,  # Adjust azimuth as needed for mesh generation (try -50, -35, -20)
             at=mean_pos,
             up=[0.0, 1.0, 0.0]
         )
@@ -415,6 +446,7 @@ def predict_cli(
             pca_distance_threshold=0.3,  # meters (max distance for PCA neighbors)
             color_threshold=0.8,  # normalized color difference (relaxed from 0.5)
             planarity_threshold=0.6,  # Westin's planarity > 0.7 for planar surfaces
+            use_weighted_pca=use_weighted_pca,  # Toggle opacity-weighted PCA
             # Visualization and rendering parameters
             extrinsics=ext_id,
             intrinsics=intrinsics,
@@ -781,6 +813,7 @@ def segment_gaussians_3d_bfs(
     pca_distance_threshold=0.5,  # meters (max distance for PCA neighbors)
     color_threshold=0.3,  # normalized color difference
     planarity_threshold=0.7,  # Westin's planarity: p = (λ_mid - λ_min) / λ_max (p > 0.7 for planar surfaces)
+    use_weighted_pca=True,  # Use opacity-weighted PCA (True) or equal-weight PCA (False)
     # Visualization and rendering parameters (optional)
     extrinsics=None,
     intrinsics=None,
@@ -812,6 +845,7 @@ def segment_gaussians_3d_bfs(
     # Get Gaussian properties - ONLY using center positions
     means_3d = gaussians.mean_vectors[0].to(device)  # [N, 3]
     colors = gaussians.colors[0].to(device)  # [N, 3], assuming RGB in [0, 1]
+    opacities = gaussians.opacities[0].to(device)  # [N] - for weighted PCA
     
     # Compute KNN using scipy KDTree (efficient, no OOM issues)
     N = means_3d.shape[0]
@@ -854,6 +888,13 @@ def segment_gaussians_3d_bfs(
     if few_neighbors_mask.any():
         few_count = few_neighbors_mask.sum().item()
         LOGGER.warning(f"{few_count} points have < 10 valid PCA neighbors (may have unstable normals)")
+    
+    # Log PCA weighting mode and opacity statistics
+    if use_weighted_pca:
+        LOGGER.info(f"Using opacity-weighted PCA for normal estimation")
+        LOGGER.info(f"Opacity stats: min={opacities.min():.4f}, max={opacities.max():.4f}, mean={opacities.mean():.4f}")
+    else:
+        LOGGER.info(f"Using equal-weight PCA for normal estimation")
     
     # Compute PCA per point (handling variable neighborhood sizes)
     normals = torch.zeros((N, 3), device=device, dtype=torch.float32)
@@ -901,8 +942,21 @@ def segment_gaussians_3d_bfs(
             centroid = neighborhood.mean(dim=0, keepdim=True)  # [1, 3]
             centered = neighborhood - centroid  # [n_valid, 3]
             
-            # Compute covariance matrix
-            cov = (centered.T @ centered) / n_valid  # [3, 3]
+            # Compute covariance matrix (weighted or unweighted based on flag)
+            if use_weighted_pca:
+                # Get opacities for weighted PCA
+                neighbor_opacities = opacities[valid_indices]  # [n_valid]
+                # Normalize weights to sum to 1
+                weights = neighbor_opacities / (neighbor_opacities.sum() + 1e-8)  # [n_valid]
+                
+                # Apply weights to centered points
+                weighted_centered = centered * weights.unsqueeze(-1)  # [n_valid, 3]
+                
+                # Compute weighted covariance matrix: C = sum_i w_i * (x_i - mean)(x_i - mean)^T
+                cov = weighted_centered.T @ centered  # [3, 3]
+            else:
+                # Equal-weight covariance matrix: C = (1/n) * sum_i (x_i - mean)(x_i - mean)^T
+                cov = (centered.T @ centered) / n_valid  # [3, 3]
             
             # Add regularization
             cov = cov + 1e-6 * torch.eye(3, device=device)
@@ -924,9 +978,6 @@ def segment_gaussians_3d_bfs(
             torch.cuda.empty_cache()
     
     LOGGER.info("PCA computation complete")
-    
-    # Extract normals (eigenvector of smallest eigenvalue - first column)
-    normals = eigenvectors[:, :, 0]  # [N, 3]
     
     # Compute Westin's planarity: p = (λ_mid - λ_min) / λ_max
     # For planar surfaces, λ_min is very small, λ_mid is larger, λ_max is largest, so p approaches 1.
