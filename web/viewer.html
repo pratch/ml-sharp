@@ -157,6 +157,13 @@
     </div>
     
     <div id="status">Select a folder to begin</div>
+    
+    <h2>Camera Info</h2>
+    <div id="cameraInfo" style="font-size: 0.85em; color: #888; padding: 10px; background: #2a2a2a; border-radius: 6px;">
+      <div>Position: <span id="camPos">-</span></div>
+      <div>Nearest 3 cams: <span id="nearestCams">-</span></div>
+      <div>Weights: <span id="weights">-</span></div>
+    </div>
   </div>
   
   <div id="container"></div>
@@ -183,23 +190,37 @@
     let splatMesh = null;
     let cameraMarkersGroup = new THREE.Group();
     let currentFolder = '';
+    let cameraPositions = []; // Store camera positions globally
+    let splatCenter = new THREE.Vector3(0, 0, 0); // Store splat center
+    let cameraMarkerMeshes = []; // Store individual camera marker meshes for color updates
+    let projectedPosMarker = null; // Marker for projected camera position
 
     // Fibonacci hemisphere generation (matching the Python implementation)
     function fibonacci_hemisphere(n_points, upper = true) {
       const phi = Math.PI * (3.0 - Math.sqrt(5.0)); // Golden angle
       const points = [];
       
-      for (let i = 0; i < n_points; i++) {
-        const y = 1 - (i / (n_points - 1)) * 2; // y from 1 to -1
-        const radius_at_y = Math.sqrt(1 - y * y);
-        const theta = phi * i;
-        
-        const x = Math.cos(theta) * radius_at_y;
-        const z = Math.sin(theta) * radius_at_y;
+      let i = 0;
+      while (points.length < n_points) {
+        const y = 1 - (i / (2 * n_points - 1)) * 2; // y from 1 to -1
         
         // Filter by hemisphere
         if ((upper && y >= 0) || (!upper && y <= 0)) {
+          const radius_at_y = Math.sqrt(1 - y * y);
+          const theta = phi * i;
+          
+          const x = Math.cos(theta) * radius_at_y;
+          const z = Math.sin(theta) * radius_at_y;
+          
           points.push(new THREE.Vector3(x, y, z));
+        }
+        
+        i++;
+        
+        // Safety check to prevent infinite loop
+        if (i > 10 * n_points) {
+          console.warn(`Could only generate ${points.length} points on hemisphere, needed ${n_points}`);
+          break;
         }
       }
       
@@ -216,6 +237,204 @@
       const positions = unit_positions.map(p => p.multiplyScalar(radius));
       
       return positions;
+    }
+
+    // Stereographic projection: map 3D point on sphere to 2D plane
+    function stereographicProject(point3d) {
+      // Project from south pole (0, -1, 0) onto plane y=0
+      const denom = 1 + point3d.y;
+      if (Math.abs(denom) < 1e-10) {
+        // Point is at south pole, map to infinity (use large value)
+        return new THREE.Vector2(0, 0);
+      }
+      return new THREE.Vector2(point3d.x / denom, point3d.z / denom);
+    }
+
+    // Compute barycentric coordinates of point p in triangle (a, b, c)
+    function barycentricCoordinates(p, a, b, c) {
+      const v0 = new THREE.Vector2(b.x - a.x, b.y - a.y);
+      const v1 = new THREE.Vector2(c.x - a.x, c.y - a.y);
+      const v2 = new THREE.Vector2(p.x - a.x, p.y - a.y);
+      
+      const dot00 = v0.dot(v0);
+      const dot01 = v0.dot(v1);
+      const dot02 = v0.dot(v2);
+      const dot11 = v1.dot(v1);
+      const dot12 = v1.dot(v2);
+      
+      const invDenom = 1 / (dot00 * dot11 - dot01 * dot01);
+      const u = (dot11 * dot02 - dot01 * dot12) * invDenom;
+      const v = (dot00 * dot12 - dot01 * dot02) * invDenom;
+      const w = 1 - u - v;
+      
+      return { w0: w, w1: u, w2: v }; // weights for a, b, c
+    }
+
+    // Check if point is inside triangle
+    function isPointInTriangle(p, a, b, c) {
+      const bary = barycentricCoordinates(p, a, b, c);
+      return bary.w0 >= 0 && bary.w1 >= 0 && bary.w2 >= 0;
+    }
+
+    // Simple Delaunay triangulation using incremental algorithm
+    // For a small number of points (30 cameras), this is sufficient
+    function delaunayTriangulation(points2d) {
+      const n = points2d.length;
+      if (n < 3) return [];
+      
+      // Find bounding triangle (super-triangle)
+      let minX = Infinity, maxX = -Infinity;
+      let minY = Infinity, maxY = -Infinity;
+      for (const p of points2d) {
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+      }
+      const dx = maxX - minX;
+      const dy = maxY - minY;
+      const dmax = Math.max(dx, dy);
+      const midX = (minX + maxX) / 2;
+      const midY = (minY + maxY) / 2;
+      
+      // Super-triangle vertices
+      const st1 = new THREE.Vector2(midX - 20 * dmax, midY - dmax);
+      const st2 = new THREE.Vector2(midX, midY + 20 * dmax);
+      const st3 = new THREE.Vector2(midX + 20 * dmax, midY - dmax);
+      
+      // Initialize with super-triangle
+      const triangles = [[n, n+1, n+2]]; // indices
+      const allPoints = [...points2d, st1, st2, st3];
+      
+      // Incremental insertion
+      for (let i = 0; i < n; i++) {
+        const p = points2d[i];
+        const badTriangles = [];
+        
+        // Find triangles whose circumcircle contains p
+        for (let j = 0; j < triangles.length; j++) {
+          const [i0, i1, i2] = triangles[j];
+          const a = allPoints[i0];
+          const b = allPoints[i1];
+          const c = allPoints[i2];
+          
+          if (inCircumcircle(p, a, b, c)) {
+            badTriangles.push(j);
+          }
+        }
+        
+        if (badTriangles.length === 0) {
+          continue; // Skip if no bad triangles
+        }
+        
+        // Find boundary of polygonal hole
+        const polygon = [];
+        for (const ti of badTriangles) {
+          const [i0, i1, i2] = triangles[ti];
+          const edges = [[i0, i1], [i1, i2], [i2, i0]];
+          
+          for (const edge of edges) {
+            let shared = false;
+            for (const tj of badTriangles) {
+              if (ti === tj) continue;
+              const [j0, j1, j2] = triangles[tj];
+              const otherEdges = [[j0, j1], [j1, j2], [j2, j0]];
+              
+              for (const oe of otherEdges) {
+                if ((edge[0] === oe[0] && edge[1] === oe[1]) ||
+                    (edge[0] === oe[1] && edge[1] === oe[0])) {
+                  shared = true;
+                  break;
+                }
+              }
+              if (shared) break;
+            }
+            if (!shared) polygon.push(edge);
+          }
+        }
+        
+        // Remove bad triangles (reverse order to preserve indices)
+        for (let j = badTriangles.length - 1; j >= 0; j--) {
+          triangles.splice(badTriangles[j], 1);
+        }
+        
+        // Add new triangles from p to polygon edges
+        for (const [e0, e1] of polygon) {
+          triangles.push([i, e0, e1]);
+        }
+      }
+      
+      // Remove triangles containing super-triangle vertices
+      const finalTriangles = triangles.filter(([i0, i1, i2]) => {
+        return i0 < n && i1 < n && i2 < n;
+      });
+      
+      return finalTriangles;
+    }
+
+    // Check if point p is inside circumcircle of triangle (a, b, c)
+    function inCircumcircle(p, a, b, c) {
+      const ax = a.x - p.x;
+      const ay = a.y - p.y;
+      const bx = b.x - p.x;
+      const by = b.y - p.y;
+      const cx = c.x - p.x;
+      const cy = c.y - p.y;
+      
+      const det = (ax * ax + ay * ay) * (bx * cy - cx * by) -
+                  (bx * bx + by * by) * (ax * cy - cx * ay) +
+                  (cx * cx + cy * cy) * (ax * by - bx * ay);
+      
+      return det < 0; // Use negative test to handle triangle orientation
+    }
+
+    // Find the 3 cameras forming a triangle containing the current camera
+    function findContainingTriangle(currentPos, cameraPositions, center) {
+      // Normalize current position to unit sphere
+      const dir = new THREE.Vector3().subVectors(currentPos, center).normalize();
+      
+      // Project all camera positions and current position to 2D
+      const camUnit = cameraPositions.map(p => 
+        new THREE.Vector3().subVectors(p, center).normalize()
+      );
+      
+      const points2d = camUnit.map(p => stereographicProject(p));
+      const currentPoint2d = stereographicProject(dir);
+      
+      // Perform Delaunay triangulation
+      const triangles = delaunayTriangulation(points2d);
+      
+      // Find triangle containing current point
+      for (const [i0, i1, i2] of triangles) {
+        const a = points2d[i0];
+        const b = points2d[i1];
+        const c = points2d[i2];
+        
+        if (isPointInTriangle(currentPoint2d, a, b, c)) {
+          // Compute barycentric weights
+          const bary = barycentricCoordinates(currentPoint2d, a, b, c);
+          
+          return {
+            indices: [i0, i1, i2],
+            weights: [bary.w0, bary.w1, bary.w2]
+          };
+        }
+      }
+      
+      // If not found (shouldn't happen with proper Delaunay), return nearest 3 cameras
+      const distances = camUnit.map((p, i) => ({
+        index: i,
+        dist: p.distanceTo(dir)
+      }));
+      distances.sort((a, b) => a.dist - b.dist);
+      
+      const nearest3 = distances.slice(0, 3);
+      const totalDist = nearest3.reduce((sum, d) => sum + d.dist, 0);
+      
+      return {
+        indices: nearest3.map(d => d.index),
+        weights: nearest3.map(d => (totalDist - d.dist) / (2 * totalDist)) // inverse distance weighting
+      };
     }
 
     // Initialize Three.js scene
@@ -248,6 +467,12 @@
       function animate() {
         requestAnimationFrame(animate);
         controls.update();
+        
+        // Update camera info if camera positions are loaded
+        if (cameraPositions.length > 0) {
+          updateCameraInfo();
+        }
+        
         renderer.render(scene, camera);
       }
       animate();
@@ -258,6 +483,57 @@
         camera.updateProjectionMatrix();
         renderer.setSize(container.clientWidth, container.clientHeight);
       });
+    }
+
+    // Update camera info display
+    function updateCameraInfo() {
+      const camPosEl = document.getElementById('camPos');
+      const nearestCamsEl = document.getElementById('nearestCams');
+      const weightsEl = document.getElementById('weights');
+      
+      if (!cameraPositions || cameraPositions.length === 0) return;
+      
+      // Display camera position
+      const pos = camera.position;
+      camPosEl.textContent = `(${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}, ${pos.z.toFixed(2)})`;
+      
+      // Find containing triangle
+      const result = findContainingTriangle(camera.position, cameraPositions, splatCenter);
+      
+      // Display nearest 3 cameras (1-indexed for user)
+      const camIndices = result.indices.map(i => i + 1).join(', ');
+      nearestCamsEl.textContent = `[${camIndices}]`;
+      
+      // Display weights
+      const weightsStr = result.weights.map(w => w.toFixed(3)).join(', ');
+      weightsEl.textContent = `[${weightsStr}]`;
+      
+      // Update camera marker colors (reset all to blue, then set nearest 3 to green)
+      if (cameraMarkerMeshes.length > 0) {
+        cameraMarkerMeshes.forEach((marker, idx) => {
+          if (result.indices.includes(idx)) {
+            marker.material.color.setHex(0x00ff00); // Green for nearest 3
+          } else {
+            marker.material.color.setHex(0x4f8cff); // Blue for others
+          }
+        });
+      }
+      
+      // Update projected position marker
+      if (projectedPosMarker) {
+        const dir = new THREE.Vector3().subVectors(camera.position, splatCenter).normalize();
+        const radius = 3.0; // Match camera sphere radius
+        const projectedPos = dir.clone().multiplyScalar(radius).add(splatCenter);
+        projectedPosMarker.position.copy(projectedPos);
+        
+        // Debug logging (remove after fixing)
+        // if (Math.random() < 0.01) { // Log 1% of frames to avoid spam
+        //   console.log('Camera pos:', camera.position);
+        //   console.log('Splat center:', splatCenter);
+        //   console.log('Direction:', dir);
+        //   console.log('Projected pos:', projectedPos);
+        // }
+      }
     }
 
     // Load available folders
@@ -312,14 +588,16 @@
     // Create camera location markers
     function createCameraMarkers(positions) {
       cameraMarkersGroup.clear();
+      cameraMarkerMeshes = [];
       
       const geometry = new THREE.SphereGeometry(0.03, 16, 16);
-      const material = new THREE.MeshBasicMaterial({ color: 0x4f8cff });
       
       positions.forEach((pos, idx) => {
+        const material = new THREE.MeshBasicMaterial({ color: 0x4f8cff }); // Clone material for each marker
         const marker = new THREE.Mesh(geometry, material);
         marker.position.copy(pos);
         cameraMarkersGroup.add(marker);
+        cameraMarkerMeshes.push(marker); // Store for later color updates
         
         // Add text label
         const canvas = document.createElement('canvas');
@@ -339,6 +617,17 @@
         sprite.position.copy(pos).add(new THREE.Vector3(0, 0.1, 0));
         cameraMarkersGroup.add(sprite);
       });
+      
+      // Create projected position marker (yellow sphere)
+      if (projectedPosMarker) {
+        scene.remove(projectedPosMarker);
+        projectedPosMarker.geometry.dispose();
+        projectedPosMarker.material.dispose();
+      }
+      const projGeometry = new THREE.SphereGeometry(0.05, 16, 16);
+      const projMaterial = new THREE.MeshBasicMaterial({ color: 0xffff00 });
+      projectedPosMarker = new THREE.Mesh(projGeometry, projMaterial);
+      scene.add(projectedPosMarker);
     }
 
     // Calculate mean position from indices
@@ -399,6 +688,8 @@
                   side: THREE.DoubleSide
                 });
                 const mesh = new THREE.Mesh(geometry, material);
+                // mesh.quaternion.set(1, 0, 0, 0);
+                // mesh.position.set(0, 0, 0);
                 meshGroup.add(mesh);
                 loadedCount++;
                 status.textContent = `Loading meshes: ${loadedCount}/${data.meshes.length}`;
@@ -416,21 +707,44 @@
         status.textContent = 'Loading Gaussian Splat...';
         const splatUrl = `/splats/butterfly.ply`;
         
+        // First, load PLY with PLYLoader to compute center
+        const plyLoader = new PLYLoader();
+        const splatGeometry = await new Promise((resolve, reject) => {
+          plyLoader.load(splatUrl, resolve, undefined, reject);
+        });
+        
+        // Compute center as MEAN of all Gaussian positions (matching Python)
+        const positions = splatGeometry.attributes.position;
+        let sumX = 0, sumY = 0, sumZ = 0;
+        const count = positions.count;
+        
+        for (let i = 0; i < count; i++) {
+          sumX += positions.getX(i);
+          sumY += positions.getY(i);
+          sumZ += positions.getZ(i);
+        }
+        
+        splatCenter = new THREE.Vector3(sumX / count, sumY / count, sumZ / count);
+        console.log('Computed GS center (mean of positions):', splatCenter);
+        console.log('Number of Gaussians:', count);
+        
+        // Dispose the geometry (we only needed it for center calculation)
+        splatGeometry.dispose();
+        
         try {
+          // Now load with SplatMesh for rendering
           splatMesh = new SplatMesh({ url: splatUrl });
-          splatMesh.quaternion.set(0.7071, 0, 0, 0.7071);
-          splatMesh.position.set(0, 0, 0);
+          console.log('Loading splat for rendering from', splatUrl);
           scene.add(splatMesh);
           
-          // Wait a bit for splat to initialize
-          await new Promise(resolve => setTimeout(resolve, 500));
-          
-          // Get splat center
-          const splatCenter = getSplatCenter(splatMesh);
+          // Splat center already computed from PLY
           controls.target.copy(splatCenter);
           
-          // Generate camera positions
-          const cameraPositions = generateCameraPositions();
+          // Generate camera positions and store globally (centered at splatCenter)
+          const cameraPositionsLocal = generateCameraPositions();
+          cameraPositions = cameraPositionsLocal.map(p => 
+            new THREE.Vector3().copy(p).add(splatCenter)
+          );
           
           // Create camera markers
           createCameraMarkers(cameraPositions);
@@ -448,17 +762,17 @@
           status.textContent = `Loaded ${data.meshes.length} meshes (no GS found)`;
           status.style.color = '#ffa500';
           
-          // Still generate camera positions and set initial camera
-          const cameraPositions = generateCameraPositions();
-          createCameraMarkers(cameraPositions);
+          // Use origin as center if no splat (store globally)
+          splatCenter = new THREE.Vector3(0, 0, 0);
+          controls.target.copy(splatCenter);
           
-          // Use origin as center if no splat
-          const center = new THREE.Vector3(0, 0, 0);
-          controls.target.copy(center);
+          // Still generate camera positions and set initial camera (store globally, centered at origin)
+          cameraPositions = generateCameraPositions(); // Already centered at origin
+          createCameraMarkers(cameraPositions);
           
           const initialCameraPos = getMeanPosition(cameraPositions, [1, 9, 14]);
           camera.position.copy(initialCameraPos);
-          camera.lookAt(center);
+          camera.lookAt(splatCenter);
           controls.update();
         }
 
