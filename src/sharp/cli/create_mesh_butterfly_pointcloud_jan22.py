@@ -51,10 +51,15 @@ def fibonacci_hemisphere(n_points, upper=True):
     
     Args:
         n_points: number of points to generate
-        upper: if True, upper hemisphere (y >= 0); if False, lower hemisphere (y <= 0)
+        upper: if True, upper hemisphere (cameras above object, y <= 0 in OpenCV)
+               if False, lower hemisphere (cameras below object, y >= 0 in OpenCV)
     
     Returns:
         Array of shape [n_points, 3] containing unit vectors on hemisphere
+    
+    Note: In OpenCV convention, Y-axis points down, so:
+          - upper hemisphere (y <= 0) places cameras above the object
+          - lower hemisphere (y >= 0) places cameras below the object
     """
     points = []
     phi = np.pi * (3.0 - np.sqrt(5.0))  # Golden angle in radians
@@ -63,7 +68,8 @@ def fibonacci_hemisphere(n_points, upper=True):
     while len(points) < n_points:
         y = 1 - (i / (2 * n_points - 1)) * 2  # y from 1 to -1
         
-        if (upper and y >= 0) or (not upper and y <= 0):
+        # In OpenCV: Y-down, so upper hemisphere = y <= 0 (above object)
+        if (upper and y <= 0) or (not upper and y >= 0):
             radius_at_y = np.sqrt(1 - y * y)
             theta = phi * i
             
@@ -81,109 +87,79 @@ def fibonacci_hemisphere(n_points, upper=True):
     return np.array(points[:n_points], dtype=np.float32)
 
 
-def cartesian_to_spherical(points):
+def compute_w2c(camera_positions, target_positions, up=None):
     """
-    Convert Cartesian coordinates to spherical coordinates.
+    Compute world-to-camera (W2C) extrinsics.
     
     Args:
-        points: [N, 3] array of (x, y, z) unit vectors
+        camera_positions: [N, 3] or [3] array of camera positions in world coordinates
+        target_positions: [N, 3] or [3] array of target (look-at) positions in world coordinates
+        up: [N, 3] or [3] world up direction, defaults to [0, 1, 0] 
     
     Returns:
-        elevation: [N] array of elevation angles in degrees
-        azimuth: [N] array of azimuth angles in degrees
+        [N, 4, 4] or [4, 4] W2C extrinsics matrices as torch tensor
     """
-    x, y, z = points[:, 0], points[:, 1], points[:, 2]
-    elev = np.arcsin(np.clip(y, -1.0, 1.0))
-    azim = np.arctan2(x, z)
-    return np.rad2deg(elev), np.rad2deg(azim)
-
-
-def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, up=None):
-    """
-    PyTorch3D-style look_at_view_transform function.
-    Generates camera extrinsics from spherical coordinates or direct specification.
-    
-    Args:
-        dist: distance from camera to the object (float or array)
-        elev: elevation angle (float or array)
-        azim: azimuth angle (float or array)
-        degrees: if True, angles are in degrees; if False, in radians
-        at: the point(s) to look at, shape [3] or [N, 3], defaults to origin
-        up: the up direction, shape [3] or [N, 3], defaults to [0, 1, 0]
-    
-    Returns:
-        4x4 extrinsics matrix as torch tensor [1, 4, 4] or [N, 4, 4]
-    """
-    # Handle defaults
-    if at is None:
-        at = np.array([[0.0, 0.0, 0.0]], dtype=np.float32)
-    else:
-        at = np.array(at, dtype=np.float32)
-        if at.ndim == 1:
-            at = at[np.newaxis, :]
+    # Convert inputs to numpy and ensure proper shape
+    cam_pos = np.atleast_2d(np.asarray(camera_positions, dtype=np.float32))
+    target_pos = np.atleast_2d(np.asarray(target_positions, dtype=np.float32))
     
     if up is None:
         up = np.array([[0.0, 1.0, 0.0]], dtype=np.float32)
     else:
-        up = np.array(up, dtype=np.float32)
-        if up.ndim == 1:
-            up = up[np.newaxis, :]
+        up = np.atleast_2d(np.asarray(up, dtype=np.float32))
     
-    # Convert scalars to arrays
-    dist = np.atleast_1d(dist).astype(np.float32)
-    elev = np.atleast_1d(elev).astype(np.float32)
-    azim = np.atleast_1d(azim).astype(np.float32)
+    # Broadcast to same batch size
+    batch_size = max(len(cam_pos), len(target_pos), len(up))
+    if len(cam_pos) == 1:
+        cam_pos = np.repeat(cam_pos, batch_size, axis=0)
+    if len(target_pos) == 1:
+        target_pos = np.repeat(target_pos, batch_size, axis=0)
+    if len(up) == 1:
+        up = np.repeat(up, batch_size, axis=0)
     
-    # Convert to radians if needed
-    if degrees:
-        elev = np.deg2rad(elev)
-        azim = np.deg2rad(azim)
-    
-    # Compute camera position from spherical coordinates
-    # Convention: azim rotates around Y axis, elev rotates around X axis
-    x = dist * np.cos(elev) * np.sin(azim)
-    y = dist * np.sin(elev)
-    z = dist * np.cos(elev) * np.cos(azim)
-    
-    camera_position = np.stack([x, y, z], axis=-1)  # [N, 3]
-    
-    # Add 'at' offset to camera position
-    camera_position = camera_position + at
-    
-    # Build extrinsics matrices for each camera
-    batch_size = len(dist)
     extrinsics_list = []
     
     for i in range(batch_size):
-        eye = camera_position[i]
-        target = at[i % len(at)]
-        up_vec = up[i % len(up)]
+        eye = cam_pos[i]
+        target = target_pos[i]
+        up_vec = up[i]
         
-        # Compute camera coordinate frame
-        z_axis = target - eye  # Forward (looking direction)
-        z_axis = z_axis / np.linalg.norm(z_axis)
+        # z = target - eye (forward)
+        z_axis = target - eye
+        z_axis = z_axis / (np.linalg.norm(z_axis) + 1e-8)
         
-        x_axis = np.cross(z_axis, up_vec)  # Right
+        # x = up(~y) x z
+        x_axis = np.cross(up_vec, z_axis)
+        x_axis_norm = np.linalg.norm(x_axis)
+        if x_axis_norm < 1e-6:
+            # Degenerate case: camera looking straight up/down
+            # Choose arbitrary right vector perpendicular to z
+            x_axis = np.array([1.0, 0.0, 0.0]) if abs(z_axis[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+            x_axis = np.cross(x_axis, z_axis)
         x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-8)
         
-        y_axis = np.cross(x_axis, z_axis)  # Up
+        # y = z x x
+        y_axis = np.cross(z_axis, x_axis)
         y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
         
-        # Build rotation matrix (world-to-camera)
-        # For OpenCV convention: camera looks down +Z axis
+        # Build W2C rotation matrix (axes as rows)
         R = np.stack([x_axis, y_axis, z_axis], axis=0)  # [3, 3]
         
-        # Translation
-        t = -R @ eye  # [3]
+        # Compute translation: t = -R @ eye
+        t = -R @ eye
         
         # Build 4x4 extrinsics matrix
         extrinsics = np.eye(4, dtype=np.float32)
         extrinsics[:3, :3] = R
         extrinsics[:3, 3] = t
-        
         extrinsics_list.append(extrinsics)
     
     extrinsics_array = np.stack(extrinsics_list, axis=0)  # [N, 4, 4]
+    
+    # Return single matrix if input was single camera
+    if camera_positions.ndim == 1 and target_positions.ndim == 1:
+        return torch.from_numpy(extrinsics_array[0])
+    
     return torch.from_numpy(extrinsics_array)
 
 
@@ -259,7 +235,7 @@ def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, 
     "--lower-hemisphere",
     is_flag=True,
     default=False,
-    help="Use lower hemisphere (y <= 0) instead of upper hemisphere (default: False).",
+    help="Place cameras below object (y >= 0 in OpenCV). Default places cameras above (y <= 0).",
 )
 def predict_cli(
     input_path: Path,
@@ -382,14 +358,17 @@ def predict_cli(
         LOGGER.info(f"Gaussian bbox: min={bbox_min}, max={bbox_max}")
         
         # Generate camera positions using Fibonacci lattice
-        hemisphere_type = "lower" if lower_hemisphere else "upper"
+        # In OpenCV: upper (cameras above) = y <= 0, lower (cameras below) = y >= 0
+        hemisphere_type = "lower (below object)" if lower_hemisphere else "upper (above object)"
         LOGGER.info(f"Generating {n_cams} camera positions on {hemisphere_type} hemisphere (radius={radius}m)...")
+        # Pass upper=True when we want cameras above (y <= 0 in OpenCV)
         unit_vectors = fibonacci_hemisphere(n_cams, upper=not lower_hemisphere)
-        elevations, azimuths = cartesian_to_spherical(unit_vectors)
         camera_positions = unit_vectors * radius + mean_pos
         
-        LOGGER.info(f"Elevation range: [{elevations.min():.1f}°, {elevations.max():.1f}°]")
-        LOGGER.info(f"Azimuth range: [{azimuths.min():.1f}°, {azimuths.max():.1f}°]")
+        LOGGER.info(f"Camera position range:")
+        LOGGER.info(f"  X: [{camera_positions[:, 0].min():.3f}, {camera_positions[:, 0].max():.3f}]")
+        LOGGER.info(f"  Y: [{camera_positions[:, 1].min():.3f}, {camera_positions[:, 1].max():.3f}]")
+        LOGGER.info(f"  Z: [{camera_positions[:, 2].min():.3f}, {camera_positions[:, 2].max():.3f}]")
         
         # Setup renderer
         renderer = gsplat.GSplatRenderer(color_space="linear")
@@ -403,29 +382,24 @@ def predict_cli(
             # Convert to 0-indexed
             cam_i = cam_idx - 1
             
-            # Get camera parameters
-            elev = elevations[cam_i]
-            azim = azimuths[cam_i]
+            # Get camera position
             cam_pos = camera_positions[cam_i]
             
             LOGGER.info(f"\n{'='*60}")
             LOGGER.info(f"Processing Camera {cam_idx}/{n_cams}")
             LOGGER.info(f"Position: [{cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f}]")
-            LOGGER.info(f"Elevation: {elev:.1f}°, Azimuth: {azim:.1f}°")
+            LOGGER.info(f"Target: [{mean_pos[0]:.3f}, {mean_pos[1]:.3f}, {mean_pos[2]:.3f}]")
             LOGGER.info(f"{'='*60}\n")
             
-            # Generate camera extrinsics
-            ext_id = look_at_view_transform(
-                dist=radius,
-                elev=elev,
-                azim=azim,
-                at=mean_pos,
-                up=[0.0, 1.0, 0.0]
+            # Generate camera extrinsics directly in OpenCV convention
+            ext_id = compute_w2c(
+                camera_positions=cam_pos,
+                target_positions=mean_pos
             )
             
             rendering_output = renderer(
                 gaussians.to(device),
-                extrinsics=ext_id.to(device),
+                extrinsics=ext_id[None].to(device),  # Add batch dimension [1, 4, 4]
                 intrinsics=intrinsics[None],
                 image_width=width,
                 image_height=height,
@@ -500,29 +474,24 @@ def predict_cli(
             # Convert to 0-indexed
             cam_i = cam_idx - 1
             
-            # Get camera parameters
-            elev = elevations[cam_i]
-            azim = azimuths[cam_i]
+            # Get camera position
             cam_pos = camera_positions[cam_i]
             
             LOGGER.info(f"\n{'='*60}")
             LOGGER.info(f"Processing Camera {cam_idx}/{n_cams}")
             LOGGER.info(f"Position: [{cam_pos[0]:.3f}, {cam_pos[1]:.3f}, {cam_pos[2]:.3f}]")
-            LOGGER.info(f"Elevation: {elev:.1f}°, Azimuth: {azim:.1f}°")
+            LOGGER.info(f"Target: [{mean_pos[0]:.3f}, {mean_pos[1]:.3f}, {mean_pos[2]:.3f}]")
             LOGGER.info(f"{'='*60}\n")
             
-            # Generate camera extrinsics
-            ext_id = look_at_view_transform(
-                dist=radius,
-                elev=elev,
-                azim=azim,
-                at=mean_pos,
-                up=[0.0, 1.0, 0.0]
+            # Generate camera extrinsics directly in OpenCV convention
+            ext_id = compute_w2c(
+                camera_positions=cam_pos,
+                target_positions=mean_pos
             )
             
             rendering_output = renderer(
                 gaussians.to(device),
-                extrinsics=ext_id.to(device),
+                extrinsics=ext_id[None].to(device),  # Add batch dimension [1, 4, 4]
                 intrinsics=intrinsics[None],
                 image_width=width,
                 image_height=height,
@@ -594,7 +563,7 @@ def predict_cli(
             
             normal_rendering = renderer(
                 gaussians_with_normals.to(device),
-                extrinsics=ext_id.to(device),
+                extrinsics=ext_id[None].to(device),  # Add batch dimension
                 intrinsics=intrinsics[None],
                 image_width=width,
                 image_height=height,
@@ -604,6 +573,8 @@ def predict_cli(
             normal_map = normal_map.cpu().numpy()
             io.save_image(normal_map, output_path / f"{image_path.stem}_cam{cam_idx:02d}_normals.png")
             LOGGER.info(f"Saved normal map to {output_path / f'{image_path.stem}_cam{cam_idx:02d}_normals.png'}")
+            # exit(0)
+            # continue
 
             # Apply gaussian blur to the depth (squeeze to 2D first)
             depth_2d = depth_np.squeeze()  # Remove singleton dimensions
@@ -623,6 +594,8 @@ def predict_cli(
             segments, pca_normals = segment_gaussians_3d_bfs(
                 gaussians,
                 device,
+                max_segments=2,
+                min_segment_size=10000, 
                 k_neighbors_pca=750,  # Large k for stable PCA normal estimation
                 k_neighbors_bfs=100,   # Smaller k for fast BFS traversal
                 normal_angle_threshold_deg=30.0,  # 30° angle threshold (relaxed from 15°)
@@ -632,7 +605,7 @@ def predict_cli(
                 planarity_threshold=0.6,  # Westin's planarity > 0.7 for planar surfaces
                 use_weighted_pca=use_weighted_pca,  # Toggle opacity-weighted PCA
                 # Visualization and rendering parameters
-                extrinsics=ext_id,
+                extrinsics=ext_id[None],
                 intrinsics=intrinsics,
                 color_image=color,
                 renderer=renderer,
@@ -666,6 +639,8 @@ def predict_cli(
             cam_pruned_output_path = output_path / f"{image_path.stem}_cam{cam_idx:02d}_pruned.ply"
             save_ply(new_gaussians, f_px, (height, width), cam_pruned_output_path)
             LOGGER.info(f"Camera {cam_idx}: Filtered Gaussians: {len(gaussian_means_3d) - len(new_gaussians.mean_vectors[0])} removed, {len(new_gaussians.mean_vectors[0])} remaining.")
+            
+            exit(0)
 
 
 def save_depth(depth_np, name):
@@ -993,6 +968,8 @@ def process_segment_mesh(
 def segment_gaussians_3d_bfs(
     gaussians,
     device,
+    max_segments=2, # Maximum number of segments to create (set to None for no limit)
+    min_segment_size = 10000, # Minimum number of Gaussians in a segment (to avoid tiny segments)
     k_neighbors_pca=200,  # Number of neighbors for PCA normal estimation (more = stable)
     k_neighbors_bfs=30,   # Number of neighbors for BFS traversal (less = fast)
     normal_angle_threshold_deg=15.0,  # Normal angle threshold in degrees
@@ -1269,8 +1246,8 @@ def segment_gaussians_3d_bfs(
     normal_threshold = np.cos(np.deg2rad(normal_angle_threshold_deg))
     LOGGER.info(f"Normal angle threshold: {normal_angle_threshold_deg}° (cosine similarity > {normal_threshold:.4f})")
     
-    max_segments = 2  # Maximum number of segments to find
-    min_segment_size = 10000  # Minimum segment size
+    # max_segments = 2  # Maximum number of segments to find
+    # min_segment_size = 10000  # Minimum segment size
     
     # BFS segmentation - Continue until no more valid seeds or max segments reached
     for seg_num in range(max_segments):

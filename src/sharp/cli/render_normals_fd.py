@@ -90,14 +90,13 @@ def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, 
         z_axis = target - eye  # Forward (looking direction)
         z_axis = z_axis / np.linalg.norm(z_axis)
         
-        x_axis = np.cross(z_axis, up_vec)  # Right
+        x_axis = np.cross(up_vec, z_axis)  # x = up(~y) × z
         x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-8)
         
-        y_axis = np.cross(x_axis, z_axis)  # Up
+        y_axis = np.cross(z_axis, x_axis)  # y = z × x
         y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
         
         # Build rotation matrix (world-to-camera)
-        # For OpenCV convention: camera looks down +Z axis
         R = np.stack([x_axis, y_axis, z_axis], axis=0)  # [3, 3]
         
         # Translation
