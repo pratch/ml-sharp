@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Hybrid Mesh + GS Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      height: 100vh;
+      width: 100vw;
+      background: #111;
+      margin: 0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    #sidebar {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 320px;
+      height: 100vh;
+      background: rgba(30, 30, 30, 0.95);
+      padding: 20px;
+      overflow-y: auto;
+      box-shadow: 2px 0 12px rgba(0, 0, 0, 0.5);
+      z-index: 100;
+      box-sizing: border-box;
+    }
+
+    #sidebar h2 {
+      margin-top: 0;
+      font-size: 1.2em;
+      border-bottom: 2px solid #4f8cff;
+      padding-bottom: 8px;
+    }
+
+    #sidebar input[type="text"] {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      border-radius: 6px;
+      font-size: 1em;
+      box-sizing: border-box;
+    }
+
+    #sidebar button {
+      width: 100%;
+      padding: 10px;
+      background: #4f8cff;
+      border: none;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1em;
+      margin-bottom: 16px;
+    }
+
+    #sidebar button:hover {
+      background: #3a7de8;
+    }
+
+    .folder-item,
+    .file-item {
+      padding: 9px;
+      margin: 4px 0;
+      background: #2a2a2a;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.9em;
+      transition: background 0.2s;
+      word-break: break-word;
+    }
+
+    .folder-item:hover,
+    .file-item:hover {
+      background: #3a3a3a;
+    }
+
+    .folder-item.active,
+    .file-item.active {
+      background: #4f8cff;
+    }
+
+    #container {
+      position: fixed;
+      left: 320px;
+      top: 0;
+      right: 0;
+      bottom: 0;
+    }
+
+    #loading {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 1.2em;
+      color: #4f8cff;
+      z-index: 1000;
+      display: none;
+      pointer-events: none;
+    }
+
+    .meta {
+      color: #bbb;
+      font-size: 0.85em;
+      margin-top: 8px;
+      line-height: 1.4;
+    }
+
+    #status {
+      color: #8fd18f;
+      font-size: 0.86em;
+      margin-top: 8px;
+      min-height: 2.6em;
+      line-height: 1.3;
+    }
+  </style>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
+    }
+  }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/stats-js@1.0.1/build/stats.min.js"></script>
+</head>
+
+<body>
+  <div id="sidebar">
+    <h2>Folder</h2>
+    <input type="text" id="folderInput" placeholder="Enter folder name...">
+    <button id="loadFolderBtn">Load Folder</button>
+
+    <h2>Recent Folders</h2>
+    <div id="folderList"></div>
+
+    <h2>Meshes</h2>
+    <div id="fileList"></div>
+
+    <div class="meta" id="metaInfo">Pick a mesh like <code>man1_mesh.ply</code> and it will load GS from <code>/splats/man1.ply</code>.</div>
+    <div id="status"></div>
+  </div>
+
+  <div id="container"></div>
+  <div id="loading">Loading scene...</div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    import { SplatMesh } from "@sparkjsdev/spark";
+    import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
+    import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    document.body.appendChild(stats.dom);
+
+    const container = document.getElementById('container');
+    const loading = document.getElementById('loading');
+    const folderInput = document.getElementById('folderInput');
+    const loadFolderBtn = document.getElementById('loadFolderBtn');
+    const folderList = document.getElementById('folderList');
+    const fileList = document.getElementById('fileList');
+    const statusEl = document.getElementById('status');
+
+    let scene;
+    let camera;
+    let renderer;
+    let controls;
+
+    let currentSplat = null;
+    let currentMesh = null;
+    let currentFolder = '';
+
+    let gui;
+    const guiParams = {
+      cameraMotion: 'None',
+      amplitude: 2,
+      speed: 1,
+      center: 50,
+      showMesh: true,
+      showSplat: true,
+    };
+
+    let linspace = [];
+    let distance = 1.0;
+    let centerDepth = 2.0;
+
+    function setStatus(text, isError = false) {
+      statusEl.style.color = isError ? '#ff8f8f' : '#8fd18f';
+      statusEl.textContent = text;
+    }
+
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(54.88, container.clientWidth / container.clientHeight, 0.1, 1000);
+      camera.position.set(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.NoToneMapping;
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enablePan = true;
+      controls.target.set(0, 0, -2);
+      controls.update();
+
+      const ambient = new THREE.AmbientLight(0xffffff, 1.0);
+      scene.add(ambient);
+
+      gui = new dat.GUI();
+      gui.add(guiParams, 'cameraMotion', ['None', 'SpiralXYZ', 'SpiralXY']);
+      gui.add(guiParams, 'amplitude', 0, 10, 0.1);
+      gui.add(guiParams, 'speed', 0.1, 5, 0.1);
+      gui.add(guiParams, 'center', 0, 99, 1).onChange((value) => {
+        if (!linspace.length) return;
+        centerDepth = 1 / linspace[Math.floor(value)];
+        controls.target.set(0, 0, -centerDepth);
+        controls.update();
+      });
+      gui.add(guiParams, 'showMesh').onChange((value) => {
+        if (currentMesh) currentMesh.visible = value;
+      });
+      gui.add(guiParams, 'showSplat').onChange((value) => {
+        if (currentSplat) currentSplat.visible = value;
+      });
+
+      window.addEventListener('keydown', (e) => {
+        if (e.code === 'Space') {
+          if (guiParams.cameraMotion !== 'None') {
+            guiParams.cameraMotion = 'None';
+            gui.updateDisplay();
+          } else {
+            camera.position.set(0, 0, 0);
+            controls.target.set(0, 0, -centerDepth);
+            controls.update();
+          }
+        }
+      });
+
+      window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+      });
+
+      renderer.setAnimationLoop((time) => {
+        stats.begin();
+        const amplitude = guiParams.amplitude * 0.005 * distance;
+        const speed = guiParams.speed * 0.001;
+
+        if (guiParams.cameraMotion === 'SpiralXYZ') {
+          camera.position.x = amplitude * Math.sin(time * speed);
+          camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
+          camera.position.z = 2 * amplitude * (Math.sin(0.5 * time * speed) - 1);
+        } else if (guiParams.cameraMotion === 'SpiralXY') {
+          camera.position.x = amplitude * Math.sin(time * speed);
+          camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
+        }
+
+        controls.update();
+        renderer.render(scene, camera);
+        stats.end();
+      });
+    }
+
+    function clearCurrent() {
+      if (currentMesh) {
+        scene.remove(currentMesh);
+        if (currentMesh.geometry) currentMesh.geometry.dispose();
+        if (currentMesh.material) {
+          if (Array.isArray(currentMesh.material)) {
+            currentMesh.material.forEach((m) => m.dispose());
+          } else {
+            currentMesh.material.dispose();
+          }
+        }
+        currentMesh = null;
+      }
+
+      if (currentSplat) {
+        scene.remove(currentSplat);
+        currentSplat = null;
+      }
+    }
+
+    function buildLinspace(meta) {
+      const minDepth = meta.min_depth ?? 0.5;
+      const maxDepth = meta.max_depth ?? 4.0;
+      linspace = [];
+      const numPoints = 100;
+      for (let i = 0; i < numPoints; i++) {
+        const t = i / (numPoints - 1);
+        const inv = (1 - t) / minDepth + t / maxDepth;
+        linspace.push(inv);
+      }
+      centerDepth = 1 / linspace[50];
+      distance = Math.max(0.01, maxDepth - minDepth);
+      controls.target.set(0, 0, -centerDepth);
+      controls.update();
+    }
+
+    async function loadFolders() {
+      try {
+        const res = await fetch('/api/folders');
+        const data = await res.json();
+        folderList.innerHTML = '';
+
+        (data.folders || []).forEach((folder) => {
+          const div = document.createElement('div');
+          div.className = 'folder-item';
+          div.textContent = folder;
+          div.onclick = () => loadFolder(folder);
+          folderList.appendChild(div);
+        });
+      } catch (error) {
+        setStatus('Failed to load folders.', true);
+      }
+    }
+
+    async function loadFolder(folder) {
+      currentFolder = folder;
+      folderInput.value = folder;
+      setStatus('Loading meshes from folder...');
+
+      document.querySelectorAll('.folder-item').forEach((el) => {
+        el.classList.toggle('active', el.textContent === folder);
+      });
+
+      try {
+        const res = await fetch(`/api/meshes/${encodeURIComponent(folder)}`);
+        const data = await res.json();
+
+        fileList.innerHTML = '';
+        const meshes = data.meshes || [];
+
+        if (!meshes.length) {
+          fileList.innerHTML = '<div style="padding:10px;color:#888;">No *_mesh.ply files found</div>';
+          setStatus('No mesh files found in selected folder.', true);
+          return;
+        }
+
+        meshes.forEach((meshName) => {
+          const div = document.createElement('div');
+          div.className = 'file-item';
+          div.textContent = meshName;
+          div.onclick = () => loadHybrid(folder, meshName);
+          fileList.appendChild(div);
+        });
+
+        setStatus(`Found ${meshes.length} mesh file(s).`);
+      } catch (error) {
+        fileList.innerHTML = '<div style="padding:10px;color:#f44;">Error loading mesh list</div>';
+        setStatus('Failed to load mesh list.', true);
+      }
+    }
+
+    async function loadHybrid(folder, meshFile) {
+      loading.style.display = 'block';
+      clearCurrent();
+
+      document.querySelectorAll('.file-item').forEach((el) => {
+        el.classList.toggle('active', el.textContent === meshFile);
+      });
+
+      const base = meshFile.replace(/_mesh\.ply$/i, '');
+      const meshURL = `/output/${folder}/${meshFile}`;
+      const splatURL = `/splats/${base}.ply`;
+      const metaURL = `/output/${folder}/${base}.json`;
+
+      setStatus(`Loading mesh: ${meshFile} | GS: ${base}.ply`);
+
+      try {
+        const metaRes = await fetch(metaURL);
+        if (metaRes.ok) {
+          const meta = await metaRes.json();
+          if (meta.vertical_fov_degrees) {
+            camera.fov = meta.vertical_fov_degrees;
+            camera.updateProjectionMatrix();
+          }
+          buildLinspace(meta);
+        }
+      } catch (error) {
+        // Optional metadata only.
+      }
+
+      try {
+        currentSplat = new SplatMesh({ url: splatURL });
+        currentSplat.quaternion.set(1, 0, 0, 0);
+        currentSplat.position.set(0, 0, 0);
+        currentSplat.visible = guiParams.showSplat;
+        scene.add(currentSplat);
+      } catch (error) {
+        setStatus(`Could not load GS at ${splatURL}`, true);
+      }
+
+      await new Promise((resolve) => {
+        const loader = new PLYLoader();
+        loader.load(
+          meshURL,
+          (geometry) => {
+            geometry.computeVertexNormals();
+
+            const colorAttr = geometry.getAttribute('color');
+            const hasVertexColors = !!colorAttr;
+            if (hasVertexColors && colorAttr.count > 0) {
+              let maxColor = 0;
+              for (let i = 0; i < colorAttr.array.length; i++) {
+                if (colorAttr.array[i] > maxColor) maxColor = colorAttr.array[i];
+              }
+              if (maxColor > 1.0) {
+                for (let i = 0; i < colorAttr.array.length; i++) {
+                  colorAttr.array[i] /= 255.0;
+                }
+                colorAttr.needsUpdate = true;
+              }
+            }
+
+            const material = hasVertexColors
+              ? new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
+              : new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.0, roughness: 1.0, side: THREE.DoubleSide });
+
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.quaternion.set(1, 0, 0, 0);
+            mesh.position.set(0, 0, 0);
+            mesh.visible = guiParams.showMesh;
+            scene.add(mesh);
+            currentMesh = mesh;
+            resolve();
+          },
+          undefined,
+          () => {
+            setStatus(`Could not load mesh at ${meshURL}`, true);
+            resolve();
+          }
+        );
+      });
+
+      loading.style.display = 'none';
+    }
+
+    loadFolderBtn.onclick = () => {
+      const folder = folderInput.value.trim();
+      if (folder) loadFolder(folder);
+    };
+
+    folderInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') loadFolderBtn.click();
+    });
+
+    initScene();
+    loadFolders();
+
+    const params = new URLSearchParams(window.location.search);
+    const qFolder = params.get('folder');
+    if (qFolder) {
+      loadFolder(qFolder);
+    }
+  </script>
+</body>
+
+</html>

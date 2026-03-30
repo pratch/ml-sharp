@@ -52,30 +52,19 @@ class MyEventHandler(FileSystemEventHandler):
         self.device = device
         self.with_rendering = with_rendering
 
-    def on_closed(self, event: FileSystemEvent) -> None:
-        if event.is_directory:
-            return
-
+    def _is_supported_image(self, image_path: Path) -> bool:
         extensions = io.get_supported_image_extensions()
+        suffix = image_path.suffix.lower()
+        return suffix in {ext.lower() for ext in extensions}
 
-        if not any(event.src_path.endswith(ext) for ext in extensions):
+    def process_image_path(self, image_path: Path) -> None:
+        if not image_path.exists() or image_path.is_dir():
             return
 
-        # image_paths = []
-        # if self.input_path.is_file():
-            # if self.input_path.suffix in extensions:
-                # image_paths = [self.input_path]
-        # else:
-            # for ext in extensions:
-                # image_paths.extend(list(self.input_path.glob(f"**/*{ext}")))
+        if not self._is_supported_image(image_path):
+            return
 
-        # if len(image_paths) == 0:
-            # LOGGER.info("No valid images found. Input was %s.", self.input_path)
-            # return
-#
-        # LOGGER.info("Processing %d valid image files.", len(image_paths))
-
-        image_paths = [Path(event.src_path)]
+        image_paths = [image_path]
 
         for (i, image_path) in enumerate(image_paths):
             print(f"Processing image {i+1}/{len(image_paths)}: {image_path}")
@@ -194,6 +183,29 @@ class MyEventHandler(FileSystemEventHandler):
             else:
                 LOGGER.info("Depth file %s already exists, skipping.", output_depth_path)
 
+    def _process_event_path(self, event_path: str) -> None:
+        self.process_image_path(Path(event_path))
+
+    def on_created(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        self._process_event_path(event.src_path)
+
+    def on_modified(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        self._process_event_path(event.src_path)
+
+    def on_moved(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        self._process_event_path(event.dest_path)
+
+    def on_closed(self, event: FileSystemEvent) -> None:
+        if event.is_directory:
+            return
+        self._process_event_path(event.src_path)
+
 
 @click.command()
 @click.option(
@@ -278,19 +290,39 @@ def predict_cli(
     output_path.mkdir(exist_ok=True, parents=True)
 
     event_handler = MyEventHandler(gaussian_predictor, input_path, output_path, torch.device(device), with_rendering)
-    observer = Observer()
-    if input_path.is_file():
-        watch_path = input_path.parent
-    else:
-        watch_path = input_path
-    observer.schedule(event_handler, str(watch_path), recursive=True)
-    observer.start()
-    LOGGER.info("Started watching %s for changes.", watch_path)
     if not loop:
-        event_handler.on_any_event(None)
-        observer.stop()
-        observer.join()
+        if input_path.is_file():
+            event_handler.process_image_path(input_path)
+        else:
+            exts = io.get_supported_image_extensions()
+            image_paths: list[Path] = []
+            for ext in exts:
+                image_paths.extend(sorted(input_path.glob(f"**/*{ext}")))
+                image_paths.extend(sorted(input_path.glob(f"**/*{ext.upper()}")))
+
+            # De-duplicate while preserving order.
+            seen: set[Path] = set()
+            unique_paths: list[Path] = []
+            for image_path in image_paths:
+                if image_path not in seen:
+                    seen.add(image_path)
+                    unique_paths.append(image_path)
+
+            if len(unique_paths) == 0:
+                LOGGER.info("No valid images found in %s", input_path)
+            else:
+                LOGGER.info("Processing %d image(s) from %s", len(unique_paths), input_path)
+                for image_path in unique_paths:
+                    event_handler.process_image_path(image_path)
     else:
+        observer = Observer()
+        if input_path.is_file():
+            watch_path = input_path.parent
+        else:
+            watch_path = input_path
+        observer.schedule(event_handler, str(watch_path), recursive=True)
+        observer.start()
+        LOGGER.info("Started watching %s for changes.", watch_path)
         try:
             while True:
                 time.sleep(1)

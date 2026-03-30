@@ -11,8 +11,6 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
-
 import click
 import cv2
 import numpy as np
@@ -22,9 +20,40 @@ from sharp.utils import io, gsplat
 from sharp.utils import vis
 from sharp.utils.gaussians import load_ply
 
-from camera_utils import compute_w2c, place_camera_spherical   
+from sharp.cli.camera_utils import compute_w2c, place_camera_spherical   
+from sharp.cli.mesh_utils import write_ply_file
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_identity_extrinsics(extrinsics: torch.Tensor, atol: float = 1e-4) -> bool:
+    eye = torch.eye(4, dtype=extrinsics.dtype, device=extrinsics.device)
+    return torch.allclose(extrinsics, eye, atol=atol)
+
+
+def _select_extrinsics(
+    camera_mode: str,
+    gaussians,
+    input_extrinsics: torch.Tensor,
+    radius: float,
+) -> tuple[torch.Tensor, str]:
+    if camera_mode == "identity":
+        return torch.eye(4, dtype=torch.float32), "identity"
+
+    if camera_mode == "ply":
+        return input_extrinsics.float(), "ply"
+
+    if camera_mode == "spherical":
+        gs_means = gaussians.mean_vectors[0].cpu().numpy()
+        mean_pos = np.mean(gs_means, axis=0)
+        cam_pos = place_camera_spherical(mean_pos, radius, az=-90.0, el=0.0)
+        return compute_w2c(camera_positions=cam_pos, target_positions=mean_pos), "spherical"
+
+    # auto: prefer PLY metadata if present, otherwise default to identity.
+    if not _is_identity_extrinsics(input_extrinsics):
+        return input_extrinsics.float(), "auto->ply"
+
+    return torch.eye(4, dtype=torch.float32), "auto->identity"
 
 
 @dataclass
@@ -36,18 +65,7 @@ class MeshResult:
     uvs: np.ndarray = field(default_factory=lambda: np.zeros((0, 2), dtype=np.float32))
 
 
-def _to_numpy(x: Any, dtype: np.dtype | None = None) -> np.ndarray:
-    if isinstance(x, torch.Tensor):
-        arr = x.detach().cpu().numpy()
-    else:
-        arr = np.asarray(x)
-    if dtype is not None:
-        arr = arr.astype(dtype, copy=False)
-    return arr
-
-
 def pass_threshold(d1: float, d2: float, threshold: float, exponent: float = -1.0) -> bool:
-    """Port of C++ pass_threshold in merge_multi.cpp."""
     if d1 <= 0.0 or d2 <= 0.0:
         return False
 
@@ -70,17 +88,14 @@ def find_edge(
     exponent: float = -1.0,
     laplacian_mask: np.ndarray | None = None,
 ) -> np.ndarray:
-    """Port of C++ find_edge in merge_multi.cpp using 4-neighbor depth checks."""
-    del img  # Kept for parity with C++ signature.
-
-    depth = _to_numpy(depth_map, np.float32)
+    depth = np.squeeze(np.asarray(depth_map, dtype=np.float32))
     rows, cols = depth.shape[:2]
     mask = np.zeros((rows, cols), dtype=np.uint8)
 
     if laplacian_mask is None:
         lap = np.zeros((rows, cols), dtype=np.uint8)
     else:
-        lap = (_to_numpy(laplacian_mask) != 0).astype(np.uint8)
+        lap = (np.asarray(laplacian_mask) != 0).astype(np.uint8)
 
     dx = (1, -1, 0, 0)
     dy = (0, 0, 1, -1)
@@ -96,6 +111,8 @@ def find_edge(
                 continue
 
             is_edge = False
+
+            # for each of 4 neighbors, if depth diff >= threshold, mark as edge
             for i in range(4):
                 nx = x + dx[i]
                 ny = y + dy[i]
@@ -118,7 +135,7 @@ def _remove_small_components_common(
     uvs: np.ndarray,
     min_faces: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Python port of remove_small_components_common from utilities.cpp."""
+    """remove small islands of connected components of faces"""
     if faces.size == 0 or min_faces <= 0:
         return vertices, faces, colors, uvs
 
@@ -202,23 +219,24 @@ def create_mesh(
     exponent: float = -1.0,
     laplacian_mask: np.ndarray | None = None,
 ) -> tuple[MeshResult, np.ndarray]:
-    """Depth-only mesh extraction following create_mesh2 logic in merge_multi.cpp."""
-    depth = _to_numpy(depth_map, np.float32)
-    img_np = _to_numpy(img)
-    if img_np.dtype != np.float32:
-        img_np = img_np.astype(np.float32)
+    """create mesh based on GS depth"""
+    depth = np.squeeze(depth_map.detach().cpu().numpy().astype(np.float32, copy=False))
 
-    K_np = _to_numpy(K, np.float32)
-    ext_np = _to_numpy(ext, np.float32)
+    K_np = K.detach().cpu().numpy().astype(np.float32, copy=False)
+    ext_np = ext.detach().cpu().numpy().astype(np.float32, copy=False)
     ext_inv = np.linalg.inv(ext_np)
 
     h, w = depth.shape[:2]
+    img_np = np.squeeze(np.asarray(img))
+    if img_np.dtype != np.float32:
+        img_np = img_np.astype(np.float32)
 
     if laplacian_mask is None:
         lap_mask = np.zeros((h, w), dtype=np.uint8)
     else:
-        lap_mask = (_to_numpy(laplacian_mask) != 0).astype(np.uint8)
+        lap_mask = (np.asarray(laplacian_mask) != 0).astype(np.uint8)
 
+    # find edges where depth discont is high, so we don't mesh there
     edge_mask = find_edge(depth, img_np, threshold, exponent, lap_mask)
     if dilate_iterations > 0:
         edge_mask = cv2.dilate(edge_mask, np.ones((3, 3), dtype=np.uint8), iterations=dilate_iterations)
@@ -248,9 +266,8 @@ def create_mesh(
             vertex_idx[y, x] = len(vertices)
             vertices.append(pt_world[:3].astype(np.float32))
 
-            # C++ stores RGB even though raster image is BGR-like.
             c = img_np[y, x]
-            colors.append(np.array([c[2], c[1], c[0]], dtype=np.float32) / 255.0)
+            colors.append(np.array([c[0], c[1], c[2]], dtype=np.float32) / 255.0)
 
             u = (fx * (x_cam / z_cam) + cx) / float(w)
             v = (fy * (y_cam / z_cam) + cy) / float(h)
@@ -259,7 +276,10 @@ def create_mesh(
     coords = ((0, 0), (1, 0), (0, 1), (1, 1))
     tset = ((0, 2, 1), (3, 1, 2))
 
-    ext_depth = None if external_depth is None else _to_numpy(external_depth, np.float32)
+    if external_depth is None:
+        ext_depth = None
+    else:
+        ext_depth = np.squeeze(np.asarray(external_depth, dtype=np.float32))
 
     for y in range(h - 1):
         for x in range(w - 1):
@@ -310,7 +330,7 @@ def create_mesh(
             min_component_size,
         )
 
-    # Keep texture as uint8 if available, mirroring C++ return contract.
+    # create texture image
     texture = np.clip(img_np, 0, 255).astype(np.uint8)
     mesh = MeshResult(vertices=vertices_np, faces=faces_np, colors=colors_np, texture=texture, uvs=uvs_np)
     return mesh, depth
@@ -333,27 +353,34 @@ def create_mesh(
 )
 @click.option("--device", type=str, default="cuda", help="Device to run on.")
 @click.option("-v", "--verbose", is_flag=True, help="Activate debug logs.")
-@click.option("--radius", type=float, default=3.0, help="Camera distance from object center in meters.")
+@click.option("--radius", type=float, default=2.5, help="Camera distance from object center in meters.")
+@click.option(
+    "--camera-mode",
+    type=click.Choice(["identity", "spherical", "ply", "auto"], case_sensitive=False),
+    default="spherical",
+    show_default=True,
+    help="How to choose extrinsics for rendering/meshing.",
+)
 def predict_cli(
     plyfile: Path,
     output_path: Path,
     device: str,
     verbose: bool,
     radius: float,
+    camera_mode: str,
 ) -> None:
-    """Render RGB and depth from loaded Gaussian splats; no mesh generation."""
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # set up logging
     log_level = logging.DEBUG if verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
         force=True,
     )
-
     log_path = output_path / "logs"
-    
-    output_path.mkdir(parents=True, exist_ok=True)
     log_path.mkdir(parents=True, exist_ok=True)
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = log_path / f"{timestamp}.log"
     file_handler = logging.FileHandler(log_file, mode="w")
@@ -364,11 +391,8 @@ def predict_cli(
     LOGGER.info("Output directory: %s", output_path)
     LOGGER.info("Logging to file: %s", log_file)
 
-
-    torch_device = torch.device(device if device != "default" else "cuda")
-
+    device = torch.device(device if device != "default" else "cuda")
     renderer = gsplat.GSplatRenderer(color_space="linear")
-
 
     ply_path = plyfile
     if not ply_path.exists():
@@ -376,7 +400,7 @@ def predict_cli(
     if not ply_path.exists():
         raise click.ClickException(f"PLY file not found: {plyfile}")
 
-    gaussians, metadata, _, _ = load_ply(ply_path)
+    gaussians, metadata, _, input_extrinsics = load_ply(ply_path)
     width, height = metadata.resolution_px
     f_px = metadata.focal_length_px
 
@@ -387,20 +411,22 @@ def predict_cli(
             [0, 0, 1, 0],
             [0, 0, 0, 1],
         ],
-        device=torch_device,
+        device=device,
         dtype=torch.float32,
     )
 
-    gs_means = gaussians.mean_vectors[0].cpu().numpy()
-    mean_pos = np.mean(gs_means, axis=0)
+    extrinsics, resolved_camera_mode = _select_extrinsics(
+        camera_mode=camera_mode.lower(),
+        gaussians=gaussians,
+        input_extrinsics=input_extrinsics,
+        radius=radius,
+    )
+    LOGGER.info("Camera mode: %s", resolved_camera_mode)
 
-    # Fixed camera: azimuth=50°, elevation=0°
-    cam_pos = place_camera_spherical(mean_pos, radius, az=50.0, el=0.0)
-    extrinsics = compute_w2c(camera_positions=cam_pos, target_positions=mean_pos)
-
+    # render GS and depth
     rendering_output = renderer(
-        gaussians.to(torch_device),
-        extrinsics=extrinsics[None].to(torch_device),
+        gaussians.to(device),
+        extrinsics=extrinsics[None].to(device),
         intrinsics=intrinsics[None],
         image_width=width,
         image_height=height,
@@ -408,7 +434,6 @@ def predict_cli(
 
     depth = rendering_output.depth[0]
     depth_np = depth.cpu().numpy()
-
     color = torch.clamp(rendering_output.color[0], 0.0, 1.0)
     color = (color.permute(1, 2, 0) * 255.0).to(dtype=torch.uint8).cpu().numpy()
 
@@ -419,12 +444,32 @@ def predict_cli(
     colored_depth_np = colored_depth_pt.squeeze(0).permute(1, 2, 0).cpu().numpy()
     io.save_image(colored_depth_np, output_path / f"{stem}_rawdepth.png")
 
+    # build mesh and save to .PLY
+    mesh, _ = create_mesh(
+        depth_map=depth,
+        img=color,
+        K=intrinsics,
+        ext=extrinsics,
+        threshold=0.01,
+        min_component_size=100,
+        dilate_iterations=1,
+        external_depth=None,
+        exponent=-1.0,
+        laplacian_mask=None,
+    )
+
+    mesh_path = output_path / f"{stem}_mesh.ply"
+    write_ply_file(mesh_path, mesh.vertices, mesh.faces, mesh.colors)
+
     LOGGER.info(
-        "Saved rendering for %s (depth min=%.4f, max=%.4f)",
+        "Saved extracted mesh for %s (depth min=%.4f, max=%.4f, verts=%d, faces=%d)",
         stem,
         float(np.nanmin(depth_np)),
         float(np.nanmax(depth_np)),
+        int(mesh.vertices.shape[0]),
+        int(mesh.faces.shape[0]),
     )
+    LOGGER.info("Saved mesh PLY to %s", mesh_path)
 
 
 if __name__ == "__main__":
