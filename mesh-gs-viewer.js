@@ -34,6 +34,9 @@ function readPlyHeader(filePath, maxBytes = 64 * 1024) {
 
 function detectPlyType(filePath) {
   const lowerName = path.basename(filePath).toLowerCase();
+  if (lowerName.endsWith('.glb')) {
+    return 'mesh';
+  }
   const header = readPlyHeader(filePath);
 
   if (!header) {
@@ -113,11 +116,11 @@ app.get('/api/files/:folder', (req, res) => {
       return;
     }
 
-    const plyFiles = files.filter((file) => file.toLowerCase().endsWith('.ply'));
+    const plyFiles = files.filter((file) => file.toLowerCase().endsWith('.ply') || file.toLowerCase().endsWith('.glb'));
 
     const filesWithMeta = plyFiles.map((file) => {
       const filePath = path.join(folderPath, file);
-      const baseName = file.replace(/\.ply$/i, '');
+      const baseName = file.replace(/\.(ply|glb)$/i, '');
       const jsonFile = `${baseName}.json`;
       const jsonPath = path.join(folderPath, jsonFile);
 

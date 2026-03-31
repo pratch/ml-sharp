@@ -150,7 +150,8 @@
     "imports": {
       "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
       "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
-      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js",
+      "three/examples/jsm/loaders/GLTFLoader.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js"
     }
   }
   </script>
@@ -177,6 +178,7 @@
     import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
     import { SplatMesh } from "@sparkjsdev/spark";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js";
 
     const container = document.getElementById('container');
     const folderInput = document.getElementById('folderInput');
@@ -217,8 +219,9 @@
       const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
       scene.add(ambientLight);
       const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
-      directionalLight.position.set(1, 1, 1);
-      scene.add(directionalLight);
+      directionalLight.position.set(0, 0, 1);
+      camera.add(directionalLight);
+      scene.add(camera);
 
       // Animation loop
       function animate() {
@@ -338,6 +341,37 @@
           currentSplat.quaternion.set(1, 0, 0, 0);
           currentSplat.position.set(0, 0, 0);
           scene.add(currentSplat);
+          loading.style.display = 'none';
+        } else if (filename.toLowerCase().endsWith('.glb')) {
+          // Load GLTF / GLB mesh
+          const loader = new GLTFLoader();
+          loader.load(url, function (gltf) {
+            const model = gltf.scene;
+            
+            // Traverse and ensure the materials are visible
+            model.traverse((child) => {
+              if (child.isMesh) {
+                if (child.material) {
+                  const materials = Array.isArray(child.material) ? child.material : [child.material];
+                  materials.forEach(mat => {
+                    mat.side = THREE.DoubleSide;
+                  });
+                }
+              }
+            });
+            
+            // Apply the same coordinate identity corrections if needed
+            model.quaternion.set(1, 0, 0, 0);
+            model.position.set(0, 0, 0);
+            
+            scene.add(model);
+            currentMesh = model;
+            loading.style.display = 'none';
+          }, undefined, function(error) {
+            console.error('Failed to load GLB: ', error);
+            alert('Failed to load GLB: ' + error.message);
+            loading.style.display = 'none';
+          });
         } else {
           // Load PLY mesh
           const loader = new PLYLoader();
@@ -379,25 +413,16 @@
             mesh.position.set(0, 0, 0);
             scene.add(mesh);
             currentMesh = mesh;
-            
-            // Keep identity-style default camera; do not auto-reframe on mesh load.
-            // Previous mesh auto-framing behavior:
-            // const box = new THREE.Box3().setFromObject(mesh);
-            // const center = box.getCenter(new THREE.Vector3());
-            // const size = box.getSize(new THREE.Vector3());
-            // const maxDim = Math.max(size.x, size.y, size.z);
-            // const fov = camera.fov * (Math.PI / 180);
-            // let cameraZ = Math.abs(maxDim / 2 / Math.tan(fov / 2));
-            // cameraZ *= 1.5; // Zoom out a bit
-            // camera.position.set(center.x, center.y, center.z + cameraZ);
-            // controls.target.copy(center);
-            // controls.update();
+            loading.style.display = 'none';
+          }, undefined, function(error) {
+            console.error('Failed to load PLY: ', error);
+            alert('Failed to load PLY: ' + error.message);
+            loading.style.display = 'none';
           });
         }
       } catch (error) {
-        console.error('Failed to load file:', error);
-        alert('Failed to load file: ' + error.message);
-      } finally {
+        console.error('Failed to init loading:', error);
+        alert('Failed to init loading: ' + error.message);
         loading.style.display = 'none';
       }
     }
