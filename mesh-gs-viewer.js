@@ -66,7 +66,7 @@ function detectPlyType(filePath) {
 
 // Serve index2.html at root
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'web', 'index2.html'));
+  res.sendFile(path.join(__dirname, 'web', 'mesh-gs-viewer.html'));
 });
 
 // API endpoint to list folders in ./output/

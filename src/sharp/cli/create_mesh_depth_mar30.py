@@ -331,12 +331,14 @@ def create_mesh(
     show_default=True,
     help="How to choose extrinsics for rendering/meshing.",
 )
+@click.option("--az", type=float, default=0.0, help="Camera azimuth (degrees) for spherical placement.")
 def predict_cli(
     plyfile: Path,
     output_path: Path,
     device: str,
     verbose: bool,
     radius: float,
+    az: float,
     camera_mode: str,
 ) -> None:
 
@@ -373,8 +375,12 @@ def predict_cli(
     width, height = metadata.resolution_px
     f_px = metadata.focal_length_px
 
-    # print("Color space:", metadata.color_space)
-    renderer = gsplat.GSplatRenderer(color_space=metadata.color_space)
+    # force hardcoded intrinsic instead of ply loader default
+    width, height = 1280, 1280
+    f_px =  1255
+
+    print("Color space:", metadata.color_space)
+    renderer = gsplat.GSplatRenderer(color_space="linear")
 
     intrinsics = torch.tensor(
         [
@@ -396,9 +402,12 @@ def predict_cli(
         resolved_camera_mode = "ply"
     elif camera_mode == "spherical":
         gs_means = gaussians.mean_vectors[0].cpu().numpy()
-        mean_pos = np.mean(gs_means, axis=0)
-        cam_pos = place_camera_spherical(mean_pos, radius, az=-90.0, el=0.0)
+        mean_pos = np.nanmean(gs_means, axis=0) # ignore nan (e.g. aomlion1 splat)
+        cam_pos = place_camera_spherical(mean_pos, radius=radius, az=az, el=0.0)
         extrinsics = compute_w2c(camera_positions=cam_pos, target_positions=mean_pos)
+        # print extrinsic
+        print("Extrinsic matrix:")
+        print(extrinsics)
         resolved_camera_mode = "spherical"
     else:
         eye = torch.eye(4, dtype=input_extrinsics.dtype, device=input_extrinsics.device)

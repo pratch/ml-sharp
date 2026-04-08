@@ -54,7 +54,10 @@ app.get('/api/meshes/:folder', (req, res) => {
     }
 
     const meshFiles = files
-      .filter((file) => file.toLowerCase().endsWith('_mesh.ply'))
+      .filter((file) => {
+        const lower = file.toLowerCase();
+        return lower.endsWith('.ply') || lower.endsWith('.glb');
+      })
       .sort((a, b) => {
         const aTime = fs.statSync(path.join(folderPath, a)).mtimeMs;
         const bTime = fs.statSync(path.join(folderPath, b)).mtimeMs;

@@ -52,6 +52,21 @@
       box-sizing: border-box;
     }
 
+    #sidebar textarea {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      border-radius: 6px;
+      font-size: 0.92em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      resize: vertical;
+      box-sizing: border-box;
+      line-height: 1.35;
+    }
+
     #sidebar button {
       width: 100%;
       padding: 10px;
@@ -88,6 +103,23 @@
     .folder-item.active,
     .file-item.active {
       background: #4f8cff;
+    }
+
+    #folderList {
+      max-height: 18vh;
+      overflow-y: auto;
+      border: 1px solid #3a3a3a;
+      border-radius: 6px;
+      padding: 6px;
+      margin-bottom: 12px;
+    }
+
+    #fileList {
+      max-height: 30vh;
+      overflow-y: auto;
+      border: 1px solid #3a3a3a;
+      border-radius: 6px;
+      padding: 6px;
     }
 
     #container {
@@ -148,9 +180,15 @@
     <div id="folderList"></div>
 
     <h2>Meshes</h2>
+    <input type="text" id="fileSearchInput" placeholder="Search meshes...">
     <div id="fileList"></div>
 
-    <div class="meta" id="metaInfo">Pick a mesh like <code>man1_mesh.ply</code> and it will load GS from <code>/splats/man1.ply</code>.</div>
+    <h2>Camera Extrinsic (W2C, OpenCV)</h2>
+    <textarea id="extrinsicInput" rows="5" spellcheck="false"></textarea>
+    <button id="applyExtrinsicBtn">Apply Extrinsic</button>
+    <button id="resetExtrinsicBtn">Reset Extrinsic</button>
+
+    <div class="meta" id="metaInfo">Pick a mesh like <code>man1.ply</code> or <code>man1.glb</code> and it will load GS from <code>/splats/man1.ply</code>.</div>
     <div id="status"></div>
   </div>
 
@@ -163,6 +201,7 @@
     import { SplatMesh } from "@sparkjsdev/spark";
     import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
     import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js";
 
     const stats = new Stats();
     stats.showPanel(0);
@@ -173,7 +212,11 @@
     const folderInput = document.getElementById('folderInput');
     const loadFolderBtn = document.getElementById('loadFolderBtn');
     const folderList = document.getElementById('folderList');
+    const fileSearchInput = document.getElementById('fileSearchInput');
     const fileList = document.getElementById('fileList');
+    const extrinsicInput = document.getElementById('extrinsicInput');
+    const applyExtrinsicBtn = document.getElementById('applyExtrinsicBtn');
+    const resetExtrinsicBtn = document.getElementById('resetExtrinsicBtn');
     const statusEl = document.getElementById('status');
 
     let scene;
@@ -182,8 +225,30 @@
     let controls;
 
     let currentSplat = null;
+    let currentPrunedSplat = null;
     let currentMesh = null;
     let currentFolder = '';
+    let currentMeshFiles = [];
+    let currentMeshFile = '';
+    let initialExtrinsicW2C = null;
+
+    const keyState = {
+      ArrowUp: false,
+      ArrowDown: false,
+      ArrowLeft: false,
+      ArrowRight: false,
+      KeyW: false,
+      KeyA: false,
+      KeyS: false,
+      KeyD: false,
+    };
+
+    const cvToThree = new THREE.Matrix4().set(
+      1, 0, 0, 0,
+      0, -1, 0, 0,
+      0, 0, -1, 0,
+      0, 0, 0, 1,
+    );
 
     let gui;
     const guiParams = {
@@ -192,7 +257,8 @@
       speed: 1,
       center: 50,
       showMesh: true,
-      showSplat: true,
+      showSplat: false,
+      showPrunedSplat: true,
     };
 
     let linspace = [];
@@ -202,6 +268,150 @@
     function setStatus(text, isError = false) {
       statusEl.style.color = isError ? '#ff8f8f' : '#8fd18f';
       statusEl.textContent = text;
+    }
+
+    function formatMatrixValue3(v) {
+      const epsilon = 5e-4;
+      const stable = Math.abs(v) < epsilon ? 0 : v;
+      return stable.toFixed(3);
+    }
+
+    function matrixToPrettyText(m) {
+      const e = m.elements;
+      const rows = [];
+      for (let r = 0; r < 4; r++) {
+        const row = [];
+        for (let c = 0; c < 4; c++) {
+          row.push(formatMatrixValue3(e[c * 4 + r]));
+        }
+        rows.push(row.join(' '));
+      }
+      return rows.join('\n');
+    }
+
+    function parseMatrixText(text) {
+      const nums = text.trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+      if (nums.length !== 16) {
+        throw new Error('Need exactly 16 numeric values (4x4).');
+      }
+
+      return new THREE.Matrix4().set(
+        nums[0], nums[1], nums[2], nums[3],
+        nums[4], nums[5], nums[6], nums[7],
+        nums[8], nums[9], nums[10], nums[11],
+        nums[12], nums[13], nums[14], nums[15],
+      );
+    }
+
+    function parseNamed4x4Block(text, blockName) {
+      const escaped = blockName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`${escaped}:\\s*\\n([^\\n]+)\\n([^\\n]+)\\n([^\\n]+)\\n([^\\n]+)`, 'i');
+      const match = text.match(re);
+      if (!match) {
+        return null;
+      }
+
+      const raw = [match[1], match[2], match[3], match[4]].join('\n');
+      try {
+        return parseMatrixText(raw);
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function getDefaultMainViewTxtName(meshFile) {
+      const stem = meshFile.replace(/\.(ply|glb)$/i, '');
+      const prefix = stem.split('_')[0] || stem;
+      return `${prefix}_camera_main_view.txt`;
+    }
+
+    async function tryApplyDefaultCameraFromText(folder, meshFile) {
+      const txtName = getDefaultMainViewTxtName(meshFile);
+      const txtURL = `/output/${encodeURIComponent(folder)}/${encodeURIComponent(txtName)}`;
+
+      try {
+        const response = await fetch(txtURL, { cache: 'no-store' });
+        if (!response.ok) {
+          return false;
+        }
+
+        const content = await response.text();
+        let w2cCv = parseNamed4x4Block(content, 'extrinsic_world_to_camera_4x4');
+
+        if (!w2cCv) {
+          const c2wCv = parseNamed4x4Block(content, 'extrinsic_camera_to_world_4x4');
+          if (c2wCv) {
+            w2cCv = c2wCv.clone().invert();
+          }
+        }
+
+        if (!w2cCv) {
+          return false;
+        }
+
+        setCameraFromExtrinsicOpenCV(w2cCv);
+        syncExtrinsicTextFromCamera();
+        setStatus(`Loaded default camera from ${txtName}.`);
+        return true;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function getExtrinsicOpenCVFromCamera() {
+      camera.updateMatrixWorld(true);
+      const w2cThree = camera.matrixWorld.clone().invert();
+      return cvToThree.clone().multiply(w2cThree).multiply(cvToThree);
+    }
+
+    function setCameraFromExtrinsicOpenCV(w2cCv) {
+      const w2cThree = cvToThree.clone().multiply(w2cCv).multiply(cvToThree);
+      const c2wThree = w2cThree.clone().invert();
+      c2wThree.decompose(camera.position, camera.quaternion, camera.scale);
+
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      controls.target.copy(camera.position).add(forward);
+      controls.update();
+    }
+
+    function syncExtrinsicTextFromCamera() {
+      if (document.activeElement === extrinsicInput) {
+        return;
+      }
+      const w2cCv = getExtrinsicOpenCVFromCamera();
+      extrinsicInput.value = matrixToPrettyText(w2cCv);
+    }
+
+    function isTypingElement(el) {
+      if (!el) {
+        return false;
+      }
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    }
+
+    function applyKeyboardMove(dtSec) {
+      const move = new THREE.Vector3();
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+      const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
+
+      if (keyState.ArrowLeft || keyState.KeyA) move.addScaledVector(right, -1);
+      if (keyState.ArrowRight || keyState.KeyD) move.addScaledVector(right, 1);
+      if (keyState.ArrowUp || keyState.KeyW) move.addScaledVector(camUp, 1);
+      if (keyState.ArrowDown || keyState.KeyS) move.addScaledVector(camUp, -1);
+
+      if (move.lengthSq() === 0) {
+        return;
+      }
+
+      const orbitDist = camera.position.distanceTo(controls.target);
+      const speed = Math.max(0.05, orbitDist * 1.2);
+      move.normalize().multiplyScalar(speed * dtSec);
+
+      camera.position.add(move);
+      controls.target.add(move);
     }
 
     function initScene() {
@@ -220,6 +430,8 @@
       controls.enablePan = true;
       controls.target.set(0, 0, -2);
       controls.update();
+
+      const clock = new THREE.Clock();
 
       const ambient = new THREE.AmbientLight(0xffffff, 1.0);
       scene.add(ambient);
@@ -240,9 +452,20 @@
       gui.add(guiParams, 'showSplat').onChange((value) => {
         if (currentSplat) currentSplat.visible = value;
       });
+      gui.add(guiParams, 'showPrunedSplat').onChange((value) => {
+        if (currentPrunedSplat) currentPrunedSplat.visible = value;
+      });
 
       window.addEventListener('keydown', (e) => {
-        if (e.code === 'Space') {
+        const typing = isTypingElement(document.activeElement);
+
+        if (!typing && e.code in keyState) {
+          keyState[e.code] = true;
+          e.preventDefault();
+          return;
+        }
+
+        if (!typing && e.code === 'Space') {
           if (guiParams.cameraMotion !== 'None') {
             guiParams.cameraMotion = 'None';
             gui.updateDisplay();
@@ -254,6 +477,14 @@
         }
       });
 
+      window.addEventListener('keyup', (e) => {
+        if (!(e.code in keyState)) {
+          return;
+        }
+        keyState[e.code] = false;
+        e.preventDefault();
+      });
+
       window.addEventListener('resize', () => {
         camera.aspect = container.clientWidth / container.clientHeight;
         camera.updateProjectionMatrix();
@@ -262,6 +493,7 @@
 
       renderer.setAnimationLoop((time) => {
         stats.begin();
+        const dt = clock.getDelta();
         const amplitude = guiParams.amplitude * 0.005 * distance;
         const speed = guiParams.speed * 0.001;
 
@@ -274,10 +506,14 @@
           camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
         }
 
+        applyKeyboardMove(dt);
         controls.update();
+        syncExtrinsicTextFromCamera();
         renderer.render(scene, camera);
         stats.end();
       });
+
+      syncExtrinsicTextFromCamera();
     }
 
     function clearCurrent() {
@@ -297,6 +533,11 @@
       if (currentSplat) {
         scene.remove(currentSplat);
         currentSplat = null;
+      }
+
+      if (currentPrunedSplat) {
+        scene.remove(currentPrunedSplat);
+        currentPrunedSplat = null;
       }
     }
 
@@ -347,44 +588,72 @@
         const res = await fetch(`/api/meshes/${encodeURIComponent(folder)}`);
         const data = await res.json();
 
-        fileList.innerHTML = '';
-        const meshes = data.meshes || [];
-
-        if (!meshes.length) {
-          fileList.innerHTML = '<div style="padding:10px;color:#888;">No *_mesh.ply files found</div>';
+        currentMeshFiles = data.meshes || [];
+        currentMeshFile = '';
+        renderMeshList();
+        if (!currentMeshFiles.length) {
           setStatus('No mesh files found in selected folder.', true);
           return;
         }
 
-        meshes.forEach((meshName) => {
-          const div = document.createElement('div');
-          div.className = 'file-item';
-          div.textContent = meshName;
-          div.onclick = () => loadHybrid(folder, meshName);
-          fileList.appendChild(div);
-        });
-
-        setStatus(`Found ${meshes.length} mesh file(s).`);
+        setStatus(`Found ${currentMeshFiles.length} mesh file(s).`);
       } catch (error) {
+        currentMeshFiles = [];
+        currentMeshFile = '';
         fileList.innerHTML = '<div style="padding:10px;color:#f44;">Error loading mesh list</div>';
         setStatus('Failed to load mesh list.', true);
       }
+    }
+
+    function renderMeshList() {
+      const query = fileSearchInput.value.trim().toLowerCase();
+      const filtered = currentMeshFiles.filter((name) => name.toLowerCase().includes(query));
+
+      fileList.innerHTML = '';
+
+      if (currentMeshFiles.length === 0) {
+        fileList.innerHTML = '<div style="padding:10px;color:#888;">No mesh files found</div>';
+        return;
+      }
+
+      if (filtered.length === 0) {
+        fileList.innerHTML = '<div style="padding:10px;color:#888;">No files match filter</div>';
+        return;
+      }
+
+      filtered.forEach((meshName) => {
+        const div = document.createElement('div');
+        div.className = 'file-item';
+        if (meshName === currentMeshFile) {
+          div.classList.add('active');
+        }
+        div.textContent = meshName;
+        div.onclick = () => loadHybrid(currentFolder, meshName);
+        fileList.appendChild(div);
+      });
     }
 
     async function loadHybrid(folder, meshFile) {
       loading.style.display = 'block';
       clearCurrent();
 
-      document.querySelectorAll('.file-item').forEach((el) => {
-        el.classList.toggle('active', el.textContent === meshFile);
-      });
+      currentMeshFile = meshFile;
+      renderMeshList();
 
-      const base = meshFile.replace(/_mesh\.ply$/i, '');
+      const usedDefaultCamera = await tryApplyDefaultCameraFromText(folder, meshFile);
+      if (!usedDefaultCamera) {
+        setStatus('No default camera text found; using current camera pose.');
+      }
+      initialExtrinsicW2C = getExtrinsicOpenCVFromCamera().clone();
+
+      // const base = meshFile.replace(/_mesh\.ply$/i, '').replace(/\.ply$/i, '').replace(/\.glb$/i, '');
+      const base = meshFile.split('_')[0];  // grab object name before _
       const meshURL = `/output/${folder}/${meshFile}`;
       const splatURL = `/splats/${base}.ply`;
+      const prunedSplatURL = `/output/${folder}/${base}_visible_splats.ply`;
       const metaURL = `/output/${folder}/${base}.json`;
 
-      setStatus(`Loading mesh: ${meshFile} | GS: ${base}.ply`);
+      setStatus(`Loading mesh: ${meshFile} | GS: ${base}.ply | Pruned: ${base}_visible_splats.ply`);
 
       try {
         const metaRes = await fetch(metaURL);
@@ -410,46 +679,91 @@
         setStatus(`Could not load GS at ${splatURL}`, true);
       }
 
+      try {
+        currentPrunedSplat = new SplatMesh({ url: prunedSplatURL });
+        currentPrunedSplat.quaternion.set(1, 0, 0, 0);
+        currentPrunedSplat.position.set(0, 0, 0);
+        currentPrunedSplat.visible = guiParams.showPrunedSplat;
+        scene.add(currentPrunedSplat);
+      } catch (error) {
+        setStatus(`Could not load pruned GS at ${prunedSplatURL}`, true);
+      }
+
       await new Promise((resolve) => {
-        const loader = new PLYLoader();
-        loader.load(
-          meshURL,
-          (geometry) => {
-            geometry.computeVertexNormals();
-
-            const colorAttr = geometry.getAttribute('color');
-            const hasVertexColors = !!colorAttr;
-            if (hasVertexColors && colorAttr.count > 0) {
-              let maxColor = 0;
-              for (let i = 0; i < colorAttr.array.length; i++) {
-                if (colorAttr.array[i] > maxColor) maxColor = colorAttr.array[i];
-              }
-              if (maxColor > 1.0) {
-                for (let i = 0; i < colorAttr.array.length; i++) {
-                  colorAttr.array[i] /= 255.0;
+        const isGLB = meshFile.toLowerCase().endsWith('.glb');
+        
+        if (isGLB) {
+          const loader = new GLTFLoader();
+          loader.load(
+            meshURL,
+            (gltf) => {
+              const mesh = gltf.scene;
+              mesh.traverse((child) => {
+                if (child.isMesh && child.material) {
+                  const map = child.material.map || null;
+                  const newMat = new THREE.MeshBasicMaterial({
+                    map: map,
+                    color: 0xffffff,
+                    side: THREE.DoubleSide
+                  });
+                  child.material.dispose();
+                  child.material = newMat;
                 }
-                colorAttr.needsUpdate = true;
-              }
+              });
+              mesh.quaternion.set(1, 0, 0, 0);
+              mesh.position.set(0, 0, 0);
+              mesh.visible = guiParams.showMesh;
+              scene.add(mesh);
+              currentMesh = mesh;
+              resolve();
+            },
+            undefined,
+            () => {
+              setStatus(`Could not load mesh at ${meshURL}`, true);
+              resolve();
             }
+          );
+        } else {
+          const loader = new PLYLoader();
+          loader.load(
+            meshURL,
+            (geometry) => {
+              geometry.computeVertexNormals();
 
-            const material = hasVertexColors
-              ? new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
-              : new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.0, roughness: 1.0, side: THREE.DoubleSide });
+              const colorAttr = geometry.getAttribute('color');
+              const hasVertexColors = !!colorAttr;
+              if (hasVertexColors && colorAttr.count > 0) {
+                let maxColor = 0;
+                for (let i = 0; i < colorAttr.array.length; i++) {
+                  if (colorAttr.array[i] > maxColor) maxColor = colorAttr.array[i];
+                }
+                if (maxColor > 1.0) {
+                  for (let i = 0; i < colorAttr.array.length; i++) {
+                    colorAttr.array[i] /= 255.0;
+                  }
+                  colorAttr.needsUpdate = true;
+                }
+              }
 
-            const mesh = new THREE.Mesh(geometry, material);
-            mesh.quaternion.set(1, 0, 0, 0);
-            mesh.position.set(0, 0, 0);
-            mesh.visible = guiParams.showMesh;
-            scene.add(mesh);
-            currentMesh = mesh;
-            resolve();
-          },
-          undefined,
-          () => {
-            setStatus(`Could not load mesh at ${meshURL}`, true);
-            resolve();
-          }
-        );
+              const material = hasVertexColors
+                ? new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
+                : new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.0, roughness: 1.0, side: THREE.DoubleSide });
+
+              const mesh = new THREE.Mesh(geometry, material);
+              mesh.quaternion.set(1, 0, 0, 0);
+              mesh.position.set(0, 0, 0);
+              mesh.visible = guiParams.showMesh;
+              scene.add(mesh);
+              currentMesh = mesh;
+              resolve();
+            },
+            undefined,
+            () => {
+              setStatus(`Could not load mesh at ${meshURL}`, true);
+              resolve();
+            }
+          );
+        }
       });
 
       loading.style.display = 'none';
@@ -463,6 +777,32 @@
     folderInput.addEventListener('keypress', (e) => {
       if (e.key === 'Enter') loadFolderBtn.click();
     });
+
+    fileSearchInput.addEventListener('input', () => {
+      renderMeshList();
+    });
+
+    applyExtrinsicBtn.onclick = () => {
+      try {
+        const w2cCv = parseMatrixText(extrinsicInput.value);
+        setCameraFromExtrinsicOpenCV(w2cCv);
+        syncExtrinsicTextFromCamera();
+        setStatus('Extrinsic applied.');
+      } catch (error) {
+        setStatus(`Invalid matrix: ${error.message}`, true);
+      }
+    };
+
+    resetExtrinsicBtn.onclick = () => {
+      if (!initialExtrinsicW2C) {
+        setStatus('No initial extrinsic is available yet.', true);
+        return;
+      }
+
+      setCameraFromExtrinsicOpenCV(initialExtrinsicW2C);
+      syncExtrinsicTextFromCamera();
+      setStatus('Camera reset to initial extrinsic.');
+    };
 
     initScene();
     loadFolders();

@@ -46,7 +46,7 @@ def _select_extrinsics(
     if camera_mode == "spherical":
         gs_means = gaussians.mean_vectors[0].cpu().numpy()
         mean_pos = np.mean(gs_means, axis=0)
-        cam_pos = place_camera_spherical(mean_pos, radius, az=-90.0, el=0.0)
+        cam_pos = place_camera_spherical(mean_pos, radius, az=0.0, el=0.0) # az 0 lego, -90 rest?
         return compute_w2c(camera_positions=cam_pos, target_positions=mean_pos), "spherical"
 
     # auto: prefer PLY metadata if present, otherwise default to identity.
