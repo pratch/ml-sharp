@@ -198,7 +198,8 @@
     <button id="resetExtrinsicBtn">Reset Extrinsic</button>
 
     <div class="meta" id="metaInfo">
-      Toggle meshes like <code>lego_cam00_mesh_multi.glb</code>; camera text is read from <code>lego_cam00_camera_main_view.txt</code>.
+      Toggle meshes like <code>lego_cam00_mesh_multi.glb</code>; camera text is read from
+      <code>lego_cam00_camera_main_view.txt</code>.
       The splat options match the original hybrid viewer.
     </div>
     <div id="status"></div>
@@ -248,10 +249,22 @@
     let camEntries = [];
     let cameraVizGroup = null;
     let lastObjectCenter = null;
+    let cameraVizSphere = null;
+    let cameraVizSphereCenter = null;
+    let cameraVizSphereRadius = null;
+    let cameraVizLookMarker = null;
+    let cameraVizArrows = [];
 
     let splatBase = '';
     let initialExtrinsicW2C = null;
     let extrinsicEditPending = false;
+
+    // Barycentric compositor state
+    let baryRTs = null;        // [WebGLRenderTarget x3]
+    let baryBlendMat = null;   // ShaderMaterial for weighted blend
+    let baryBlendScene = null;
+    let baryBlendCam = null;
+    let baryDepthMat = null;
 
     const loadedMeshesByCam = new Map();
 
@@ -282,6 +295,7 @@
       speed: 1,
       center: 50,
       showCameraVizMain: false,
+      interpolation: 'Off',
       showMesh: true,
       showSplat: false,
       showPrunedSplat: true,
@@ -322,6 +336,285 @@
       if (!root) return;
       root.traverse((obj) => {
         obj.layers.set(layer);
+      });
+    }
+
+    function updateLookMarker() {
+      if (!cameraVizLookMarker || !cameraVizSphereCenter || !cameraVizSphereRadius) {
+        return;
+      }
+
+      const origin = camera.position.clone();
+      const toCenter = controls.target.clone().sub(origin);
+      if (toCenter.lengthSq() < 1e-8) {
+        cameraVizLookMarker.visible = false;
+        return;
+      }
+      toCenter.normalize();
+
+      const hit = cameraVizSphereCenter.clone().add(toCenter.multiplyScalar(cameraVizSphereRadius));
+      const nudge = hit.clone().sub(cameraVizSphereCenter).normalize().multiplyScalar(cameraVizSphereRadius * 0.002);
+      cameraVizLookMarker.position.copy(hit.add(nudge));
+      cameraVizLookMarker.visible = true;
+
+      if (!cameraVizArrows.length) {
+        return;
+      }
+
+      const distances = cameraVizArrows.map((entry, idx) => ({
+        idx,
+        dist: entry.position.distanceTo(origin),
+      }));
+      distances.sort((a, b) => a.dist - b.dist);
+      const closest = new Set(distances.slice(0, 3).map((d) => d.idx));
+
+      cameraVizArrows.forEach((entry, idx) => {
+        const color = closest.has(idx) ? 0x33ff77 : 0xff3333;
+        entry.arrow.setColor(color);
+      });
+    }
+
+    // Set opacity on every material inside a mesh/group (0 = fully transparent, 1 = opaque).
+    function setMeshOpacity(root, opacity) {
+      if (!root) return;
+      root.traverse((obj) => {
+        if (!obj.isMesh) return;
+        const mats = Array.isArray(obj.material) ? obj.material : [obj.material];
+        mats.forEach((mat) => {
+          if (!mat) return;
+          if (opacity < 1.0) {
+            mat.transparent = true;
+            mat.opacity = opacity;
+          } else {
+            mat.transparent = false;
+            mat.opacity = 1.0;
+          }
+          mat.needsUpdate = true;
+        });
+      });
+    }
+
+    // Compute IDW barycentric weights for the 3 nearest loaded cams.
+    // Returns { camIndices:[c0,c1,c2], weights:[w0,w1,w2] } with null/0 padding,
+    // or null when there is no camera viz data.
+    function computeBaryWeights() {
+      if (!loadedMeshesByCam.size || !cameraVizArrows.length) return null;
+      const camPos = camera.position;
+      const entries = [];
+      for (const entry of cameraVizArrows) {
+        if (entry.camIndex == null) continue;
+        if (!loadedMeshesByCam.has(entry.camIndex)) continue;
+        entries.push({ camIndex: entry.camIndex, dist: entry.position.distanceTo(camPos) });
+      }
+      if (!entries.length) return null;
+      entries.sort((a, b) => a.dist - b.dist);
+
+      const top3 = entries.slice(0, 3);
+      const EPS = 1e-6;
+      const invDists = top3.map((e) => 1.0 / Math.max(e.dist, EPS));
+      const sumInv = invDists.reduce((s, w) => s + w, 0);
+      const linearW = invDists.map((w) => w / sumInv);
+      const SHARP = 4;
+      const sharpW = linearW.map((w) => Math.pow(w, SHARP));
+      const sharpSum = sharpW.reduce((s, w) => s + w, 0);
+      const weights = sharpW.map((w) => w / sharpSum);
+
+      const MIN_W = 0.02;
+      const camIndices = [null, null, null];
+      const finalW = [0, 0, 0];
+      let visSum = 0;
+      top3.forEach((e, i) => {
+        if (weights[i] >= MIN_W) { camIndices[i] = e.camIndex; finalW[i] = weights[i]; visSum += weights[i]; }
+      });
+      if (visSum < EPS) return null;
+      for (let i = 0; i < 3; i++) finalW[i] /= visSum;
+      return { camIndices, weights: finalW };
+    }
+
+    // Create 3 render targets + fullscreen blend shader for Barycentric mode.
+    function initBaryCompositor() {
+      const w = container.clientWidth;
+      const h = container.clientHeight;
+      baryRTs = [0, 1, 2].map(() => new THREE.WebGLRenderTarget(w, h, {
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+      }));
+      baryBlendMat = new THREE.RawShaderMaterial({
+        uniforms: {
+          tex1: { value: null }, tex2: { value: null }, tex3: { value: null },
+          w1: { value: 0.333 }, w2: { value: 0.333 }, w3: { value: 0.333 },
+        },
+        vertexShader: `
+          precision mediump float;
+          attribute vec2 position;
+          attribute vec2 uv;
+          varying vec2 vUv;
+          void main() { vUv = uv; gl_Position = vec4(position, 0.0, 1.0); }
+        `,
+        fragmentShader: `
+          precision mediump float;
+          uniform sampler2D tex1, tex2, tex3;
+          uniform float w1, w2, w3;
+          varying vec2 vUv;
+
+          vec3 linearToSRGB(vec3 color) {
+            return pow(color, vec3(1.0 / 2.2));
+          }
+
+          void main() {
+            vec4 c1 = texture2D(tex1, vUv);
+            vec4 c2 = texture2D(tex2, vUv);
+            vec4 c3 = texture2D(tex3, vUv);
+            // RT alpha encodes mesh coverage (1 = mesh pixel, 0 = background).
+            // Effective per-cam contribution = interpolation weight * coverage.
+            float aw1 = w1 * c1.a;
+            float aw2 = w2 * c2.a;
+            float aw3 = w3 * c3.a;
+            float aSum = aw1 + aw2 + aw3;
+            if (aSum < 0.001) discard; // no mesh coverage → let splat show through
+            vec3 blended = (aw1 * c1.rgb + aw2 * c2.rgb + aw3 * c3.rgb) / aSum;
+            gl_FragColor = vec4(linearToSRGB(blended), min(aSum, 1.0));
+          }
+        `,
+        transparent: true, // needed so mesh blend alpha-composites over the splat below
+        depthTest: false,
+        depthWrite: false,
+      });
+      const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), baryBlendMat);
+      baryBlendScene = new THREE.Scene();
+      baryBlendScene.add(quad);
+      baryBlendCam = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+      baryDepthMat = new THREE.MeshBasicMaterial({ colorWrite: false, depthWrite: true, side: THREE.DoubleSide });
+    }
+
+    // Render each of 3 cam meshes to its own RT, then composite with blend shader.
+    function renderBaryComposite() {
+      if (!baryRTs || !baryBlendMat || !baryDepthMat) { renderer.render(scene, camera); return; }
+      const bary = computeBaryWeights();
+      if (!bary) {
+        loadedMeshesByCam.forEach((m) => { setMeshOpacity(m, 1.0); m.visible = guiParams.showMesh; });
+        renderer.render(scene, camera);
+        return;
+      }
+
+      const splatObjs = [currentSplat, currentPrunedSplat].filter(Boolean);
+      const splatWasVisible = splatObjs.map((s) => s.visible);
+      const vizWasVisible = cameraVizGroup ? cameraVizGroup.visible : false;
+      const lookWasVisible = cameraVizLookMarker ? cameraVizLookMarker.visible : false;
+
+      // Step 1: Hide meshes and splats, render background.
+      splatObjs.forEach((s) => { s.visible = false; });
+      loadedMeshesByCam.forEach((m) => { m.visible = false; });
+      
+      renderer.autoClear = true;
+      renderer.render(scene, camera);
+      renderer.autoClear = false; // keep false for subsequent main screen passes
+      
+      if (cameraVizGroup) cameraVizGroup.visible = false;
+      if (cameraVizLookMarker) cameraVizLookMarker.visible = false;
+
+      // Step 2: Render each cam's mesh to its RT with transparent background.
+      const savedClearColor = new THREE.Color();
+      const savedClearAlpha = renderer.getClearAlpha();
+      renderer.getClearColor(savedClearColor);
+      renderer.setClearColor(0x000000, 0);
+
+      for (let i = 0; i < 3; i++) {
+        const camIdx = bary.camIndices[i];
+        loadedMeshesByCam.forEach((mesh, idx) => {
+          setMeshOpacity(mesh, 1.0);
+          mesh.visible = guiParams.showMesh && camIdx !== null && idx === camIdx;
+        });
+        renderer.setRenderTarget(baryRTs[i]);
+        renderer.clear();
+        renderer.render(scene, camera);
+      }
+
+      renderer.setClearColor(savedClearColor, savedClearAlpha);
+      renderer.setRenderTarget(null);
+
+      // Step 3: Populate main depth buffer with the meshes' depth.
+      if (guiParams.showMesh) {
+        const top3Set = new Set(bary.camIndices.filter(idx => idx !== null));
+        loadedMeshesByCam.forEach((mesh, idx) => {
+          mesh.visible = top3Set.has(idx);
+        });
+
+        const oldMats = new Map();
+        loadedMeshesByCam.forEach((mesh) => {
+          if (mesh.visible) {
+            mesh.traverse((child) => {
+              if (child.isMesh && child.material) {
+                oldMats.set(child, child.material);
+                child.material = baryDepthMat;
+              }
+            });
+          }
+        });
+
+        renderer.render(scene, camera);
+
+        oldMats.forEach((mat, child) => {
+          child.material = mat;
+        });
+        
+        // Step 4: Composite blended meshes ON TOP of the background, matching the depth buffer.
+        baryBlendMat.uniforms.tex1.value = baryRTs[0].texture;
+        baryBlendMat.uniforms.tex2.value = baryRTs[1].texture;
+        baryBlendMat.uniforms.tex3.value = baryRTs[2].texture;
+        baryBlendMat.uniforms.w1.value   = bary.weights[0];
+        baryBlendMat.uniforms.w2.value   = bary.weights[1];
+        baryBlendMat.uniforms.w3.value   = bary.weights[2];
+        renderer.render(baryBlendScene, baryBlendCam);
+      }
+
+      // Step 5: Render splats. They will test against the mesh depth buffer correctly.
+      splatObjs.forEach((s, i) => { s.visible = splatWasVisible[i]; });
+      const anyVisible = splatObjs.some((s) => s.visible);
+      if (anyVisible) {
+        loadedMeshesByCam.forEach((m) => { m.visible = false; });
+        renderer.render(scene, camera);
+      }
+
+      // Restore state
+      renderer.autoClear = true;
+      loadedMeshesByCam.forEach((m) => { m.visible = guiParams.showMesh; });
+      if (cameraVizGroup) cameraVizGroup.visible = vizWasVisible;
+      if (cameraVizLookMarker) cameraVizLookMarker.visible = lookWasVisible;
+    }
+
+    function updateInterpolationVisibility() {
+      if (!loadedMeshesByCam.size) return;
+      // Barycentric is handled by renderBaryComposite() in the animation loop.
+      if (guiParams.interpolation === 'Barycentric') {
+        loadedMeshesByCam.forEach((m) => { setMeshOpacity(m, 1.0); m.visible = guiParams.showMesh; });
+        return;
+      }
+
+      if (guiParams.interpolation === 'Off') {
+        loadedMeshesByCam.forEach((mesh) => { setMeshOpacity(mesh, 1.0); mesh.visible = guiParams.showMesh; });
+        return;
+      }
+
+      // Gather distances (used by Nearest).
+      const camPos = camera.position;
+      const entries = [];
+      for (const entry of cameraVizArrows) {
+        if (entry.camIndex == null) continue;
+        if (!loadedMeshesByCam.has(entry.camIndex)) continue;
+        entries.push({ camIndex: entry.camIndex, dist: entry.position.distanceTo(camPos) });
+      }
+      if (!entries.length) {
+        loadedMeshesByCam.forEach((mesh) => { setMeshOpacity(mesh, 1.0); mesh.visible = guiParams.showMesh; });
+        return;
+      }
+      entries.sort((a, b) => a.dist - b.dist);
+
+      // ── Nearest ───────────────────────────────────────────────────────────────
+      const nearestIdx = entries[0].camIndex;
+      loadedMeshesByCam.forEach((mesh, camIndex) => {
+        setMeshOpacity(mesh, 1.0);
+        mesh.visible = guiParams.showMesh && camIndex === nearestIdx;
       });
     }
 
@@ -574,6 +867,7 @@
         controls.target.set(0, 0, -centerDepth);
         controls.update();
       });
+      gui.add(guiParams, 'interpolation', ['Off', 'Nearest', 'Barycentric']);
       gui.add(guiParams, 'showCameraVizMain').name('showCamVizMain').onChange((value) => {
         if (value) {
           camera.layers.enable(1);
@@ -585,6 +879,7 @@
         loadedMeshesByCam.forEach((mesh) => {
           mesh.visible = value;
         });
+        updateInterpolationVisibility();
       });
       gui.add(guiParams, 'showSplat').onChange((value) => {
         if (value) {
@@ -636,6 +931,10 @@
         cameraSecondary.aspect = containerSecondary.clientWidth / containerSecondary.clientHeight;
         cameraSecondary.updateProjectionMatrix();
         rendererSecondary.setSize(containerSecondary.clientWidth, containerSecondary.clientHeight);
+
+        if (baryRTs) {
+          baryRTs.forEach((rt) => rt.setSize(container.clientWidth, container.clientHeight));
+        }
       });
 
       renderer.setAnimationLoop((time) => {
@@ -656,7 +955,13 @@
         applyKeyboardMove(dt);
         controls.update();
         syncExtrinsicTextFromCamera();
-        renderer.render(scene, camera);
+        updateLookMarker();
+        if (guiParams.interpolation === 'Barycentric') {
+          renderBaryComposite();
+        } else {
+          updateInterpolationVisibility();
+          renderer.render(scene, camera);
+        }
 
         if (cameraSecondary) {
           const target = controls.target.clone();
@@ -671,6 +976,8 @@
       });
 
       syncExtrinsicTextFromCamera();
+
+      initBaryCompositor();
     }
 
     function disposeObject3D(root) {
@@ -705,6 +1012,12 @@
           disposeObject3D(child);
         }
       }
+
+      cameraVizSphere = null;
+      cameraVizSphereCenter = null;
+      cameraVizSphereRadius = null;
+      cameraVizLookMarker = null;
+      cameraVizArrows = [];
     }
 
     function createTextSprite(text) {
@@ -789,10 +1102,20 @@
           transparent: true,
           opacity: 0.35,
         });
-        const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
-        sphere.position.copy(center);
-        setLayerRecursive(sphere, 1);
-        cameraVizGroup.add(sphere);
+        cameraVizSphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+        cameraVizSphere.position.copy(center);
+        setLayerRecursive(cameraVizSphere, 1);
+        cameraVizGroup.add(cameraVizSphere);
+
+        cameraVizSphereCenter = center.clone();
+        cameraVizSphereRadius = radius;
+
+        const markerGeometry = new THREE.SphereGeometry(Math.max(0.015, radius * 0.025), 18, 18);
+        const markerMaterial = new THREE.MeshBasicMaterial({ color: 0xffffff, depthTest: false, depthWrite: false });
+        cameraVizLookMarker = new THREE.Mesh(markerGeometry, markerMaterial);
+        cameraVizLookMarker.visible = false;
+        setLayerRecursive(cameraVizLookMarker, 1);
+        cameraVizGroup.add(cameraVizLookMarker);
 
         controls.target.copy(center);
         controls.update();
@@ -801,12 +1124,15 @@
         const headLength = arrowLength * 0.35;
         const headWidth = arrowLength * 0.22;
 
+        cameraVizArrows = [];
         cameras.forEach((cam) => {
           const pos = cvPosToThree(new THREE.Vector3(...cam.position));
           const dir = normalizeVector3(cvDirToThree(new THREE.Vector3(...(cam.forward || []))));
           const arrow = new THREE.ArrowHelper(dir, pos, arrowLength, 0xff3333, headLength, headWidth);
           setLayerRecursive(arrow, 1);
           cameraVizGroup.add(arrow);
+          const camIndex = cam.camIndex ?? cam.id ?? null;
+          cameraVizArrows.push({ arrow, position: pos, camIndex: camIndex !== null ? Number(camIndex) : null });
 
           const label = createTextSprite(cam.id ?? cam.camIndex ?? '?');
           const labelPos = pos.clone().add(dir.clone().multiplyScalar(arrowLength * 1.1));
@@ -814,6 +1140,8 @@
           setLayerRecursive(label, 1);
           cameraVizGroup.add(label);
         });
+
+        updateLookMarker();
       } catch {
         // Camera viz is optional; ignore errors.
       }
