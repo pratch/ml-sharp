@@ -16,9 +16,30 @@ import numpy as np
 import torch
 import cv2 as cv
 from sharp.utils import io, gsplat
-from sharp.utils.gaussians import load_ply
+from sharp.utils.gaussians import Gaussians3D, load_ply
 
 LOGGER = logging.getLogger(__name__)
+
+
+def filter_invalid_position_gaussians(gaussians: Gaussians3D) -> tuple[Gaussians3D, int]:
+    """Filter out Gaussians with non-finite position values (NaN/Inf)."""
+    position_is_finite = torch.isfinite(gaussians.mean_vectors).all(dim=-1)  # [B, N]
+
+    # Keep only Gaussians valid across all batches for consistent indexing.
+    valid_mask = position_is_finite.all(dim=0)  # [N]
+    n_invalid = int((~valid_mask).sum().item())
+
+    if n_invalid == 0:
+        return gaussians, 0
+
+    filtered_gaussians = Gaussians3D(
+        mean_vectors=gaussians.mean_vectors[:, valid_mask],
+        singular_values=gaussians.singular_values[:, valid_mask],
+        quaternions=gaussians.quaternions[:, valid_mask],
+        colors=gaussians.colors[:, valid_mask],
+        opacities=gaussians.opacities[:, valid_mask],
+    )
+    return filtered_gaussians, n_invalid
 
 
 def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, up=None):
@@ -86,10 +107,12 @@ def look_at_view_transform(dist=1.0, elev=0.0, azim=0.0, degrees=True, at=None, 
         z_axis = target - eye  # Forward (looking direction)
         z_axis = z_axis / np.linalg.norm(z_axis)
         
-        x_axis = np.cross(z_axis, up_vec)  # Right
+        # x_axis = np.cross(z_axis, up_vec)  # Right
+        x_axis = np.cross(up_vec, z_axis)  # Right
         x_axis = x_axis / (np.linalg.norm(x_axis) + 1e-8)
         
-        y_axis = np.cross(x_axis, z_axis)  # Up
+        # y_axis = np.cross(x_axis, z_axis)  # Up
+        y_axis = np.cross(z_axis, x_axis)  # Up
         y_axis = y_axis / (np.linalg.norm(y_axis) + 1e-8)
         
         # Build rotation matrix (world-to-camera)
@@ -266,10 +289,16 @@ def render_multiview_cli(
     # Load Gaussian Splats
     LOGGER.info(f"Loading Gaussian Splats from {input_path}")
     gaussians, metadata, _, _ = load_ply(input_path)
+    gaussians, n_invalid_gaussians = filter_invalid_position_gaussians(gaussians)
     width, height = metadata.resolution_px
     f_px = metadata.focal_length_px
+
+    if gaussians.mean_vectors[0].shape[0] == 0:
+        raise ValueError("All Gaussians have invalid positions (NaN/Inf) after filtering.")
     
     LOGGER.info(f"Loaded {gaussians.mean_vectors[0].shape[0]} Gaussians")
+    if n_invalid_gaussians > 0:
+        LOGGER.warning(f"Filtered out {n_invalid_gaussians} Gaussians with invalid positions (NaN/Inf).")
     LOGGER.info(f"Resolution: {width}x{height}, focal length: {f_px:.2f}px")
     
     # Compute intrinsics
@@ -284,14 +313,14 @@ def render_multiview_cli(
         dtype=torch.float32,
     )
     
-    # Get object center
+    # Get object center from valid positions
     gs_means = gaussians.mean_vectors[0].cpu().numpy()  # [N, 3]
-    mean_pos = np.mean(gs_means, axis=0)
+    center_pos = np.median(gs_means, axis=0)
     std_pos = np.std(gs_means, axis=0)
     bbox_min = np.min(gs_means, axis=0)
     bbox_max = np.max(gs_means, axis=0)
     
-    LOGGER.info(f"Object center: [{mean_pos[0]:.3f}, {mean_pos[1]:.3f}, {mean_pos[2]:.3f}]")
+    LOGGER.info(f"Object center (median): [{center_pos[0]:.3f}, {center_pos[1]:.3f}, {center_pos[2]:.3f}]")
     LOGGER.info(f"Object std: [{std_pos[0]:.3f}, {std_pos[1]:.3f}, {std_pos[2]:.3f}]")
     LOGGER.info(f"Object bbox: min={bbox_min}, max={bbox_max}")
     
@@ -307,11 +336,11 @@ def render_multiview_cli(
     LOGGER.info(f"Azimuth range: [{azimuths.min():.1f}°, {azimuths.max():.1f}°]")
     
     # Compute actual camera positions in world space
-    camera_positions = unit_vectors * radius + mean_pos  # [N, 3]
+    camera_positions = unit_vectors * radius + center_pos  # [N, 3]
     
     # Save camera data to JSON for Three.js visualization
     camera_data = {
-        "object_center": mean_pos.tolist(),
+        "object_center": center_pos.tolist(),
         "radius": float(radius),
         "n_cams": int(n_cams),
         "hemisphere": "lower" if lower_hemisphere else "upper",
@@ -345,7 +374,7 @@ def render_multiview_cli(
         dist=vis_radius,
         elev=vis_elev,
         azim=vis_azim,
-        at=mean_pos,
+        at=center_pos,
         up=[0.0, 1.0, 0.0]
     )
     
@@ -404,7 +433,7 @@ def render_multiview_cli(
                    cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv.LINE_AA)  # Red text on top
     
     # Draw object center as a green cross
-    obj_center_homo = np.append(mean_pos, 1.0)
+    obj_center_homo = np.append(center_pos, 1.0)
     obj_center_vis = vis_ext_np @ obj_center_homo
     if obj_center_vis[2] > 0:
         u_obj = int(round((f_x * obj_center_vis[0] / obj_center_vis[2]) + c_x))
@@ -433,12 +462,12 @@ def render_multiview_cli(
             dist=radius,
             elev=elev,
             azim=azim,
-            at=mean_pos,
+            at=center_pos,
             up=[0.0, 1.0, 0.0]  # Y-axis up
         )
         
         # Compute actual camera position for logging
-        cam_pos = unit_vectors[cam_idx] * radius + mean_pos
+        cam_pos = unit_vectors[cam_idx] * radius + center_pos
         
         if cam_idx % 10 == 0 or cam_idx < 5:
             LOGGER.info(f"Camera {cam_idx+1}/{n_cams}: elev={elev:.1f}°, azim={azim:.1f}°, pos=[{cam_pos[0]:.2f}, {cam_pos[1]:.2f}, {cam_pos[2]:.2f}]")

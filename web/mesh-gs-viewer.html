@@ -1,0 +1,779 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8">
+  <title>Mesh & GS Viewer</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <style>
+    body {
+      display: flex;
+      flex-direction: column;
+      align-items: stretch;
+      height: 100vh;
+      width: 100vw;
+      background: #1a1a1a;
+      margin: 0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      color: #fff;
+      overflow: hidden;
+    }
+
+    #sidebar {
+      position: fixed;
+      left: 0;
+      top: 0;
+      width: 320px;
+      height: 100vh;
+      background: rgba(30, 30, 30, 0.95);
+      padding: 20px;
+      overflow-y: auto;
+      box-shadow: 2px 0 12px rgba(0,0,0,0.5);
+      z-index: 100;
+    }
+
+    #sidebar h2 {
+      margin-top: 0;
+      font-size: 1.3em;
+      border-bottom: 2px solid #4f8cff;
+      padding-bottom: 8px;
+    }
+
+    #sidebar input[type="text"] {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      border-radius: 6px;
+      font-size: 1em;
+      box-sizing: border-box;
+    }
+
+    #sidebar textarea {
+      width: 100%;
+      padding: 10px;
+      margin-bottom: 12px;
+      background: #2a2a2a;
+      border: 1px solid #444;
+      color: #fff;
+      border-radius: 6px;
+      font-size: 0.92em;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      resize: vertical;
+      box-sizing: border-box;
+      line-height: 1.35;
+    }
+
+    #sidebar button {
+      width: 100%;
+      padding: 10px;
+      background: #4f8cff;
+      border: none;
+      color: white;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 1em;
+      margin-bottom: 16px;
+    }
+
+    #sidebar button:hover {
+      background: #3a7de8;
+    }
+
+    #folderList {
+      margin-bottom: 20px;
+      max-height: 18vh;
+      overflow-y: auto;
+      border: 1px solid #3a3a3a;
+      border-radius: 6px;
+      padding: 6px;
+    }
+
+    .folder-item {
+      padding: 8px;
+      margin: 4px 0;
+      background: #2a2a2a;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 0.9em;
+      transition: background 0.2s;
+    }
+
+    .folder-item:hover {
+      background: #3a3a3a;
+    }
+
+    .folder-item.active {
+      background: #4f8cff;
+    }
+
+    #fileList {
+      margin-top: 20px;
+      max-height: 30vh;
+      overflow-y: auto;
+      border: 1px solid #3a3a3a;
+      border-radius: 6px;
+      padding: 6px;
+    }
+
+    .file-item {
+      padding: 10px;
+      margin: 6px 0;
+      background: #2a2a2a;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+
+    .file-item:hover {
+      background: #3a3a3a;
+    }
+
+    .file-item.active {
+      background: #4f8cff;
+    }
+
+    .file-type {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 3px;
+      font-size: 0.8em;
+      margin-left: 8px;
+    }
+
+    .file-type.gs {
+      background: #28a745;
+    }
+
+    .file-type.mesh {
+      background: #ff6b35;
+    }
+
+    #container {
+      position: fixed;
+      left: 320px;
+      top: 0;
+      right: 0;
+      bottom: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    #loading {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      font-size: 1.5em;
+      color: #4f8cff;
+    }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+      "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
+      "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js",
+      "three/examples/jsm/loaders/GLTFLoader.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js"
+    }
+  }
+  </script>
+</head>
+
+<body>
+  <div id="sidebar">
+    <h2>Folder</h2>
+    <input type="text" id="folderInput" placeholder="Enter folder name...">
+    <button id="loadFolderBtn">Load Folder</button>
+    
+    <h2>Recent Folders</h2>
+    <div id="folderList"></div>
+    
+    <h2>Files</h2>
+    <input type="text" id="fileSearchInput" placeholder="Search files...">
+    <div id="fileList"></div>
+
+    <h2>Camera Extrinsic (W2C, OpenCV)</h2>
+    <textarea id="extrinsicInput" rows="5" spellcheck="false"></textarea>
+    <button id="applyExtrinsicBtn">Apply Extrinsic</button>
+    <button id="resetExtrinsicBtn">Reset Extrinsic</button>
+    <div id="extrinsicStatus" style="font-size:0.85em;color:#aaa;margin-top:-8px;margin-bottom:16px;">
+      Arrow keys move camera (left/right strafe, up/down vertical). Orbit drag still works.
+    </div>
+  </div>
+  
+  <div id="container"></div>
+  <div id="loading" style="display:none;">Loading...</div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    import { SplatMesh } from "@sparkjsdev/spark";
+    import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js";
+
+    const container = document.getElementById('container');
+    const folderInput = document.getElementById('folderInput');
+    const loadFolderBtn = document.getElementById('loadFolderBtn');
+    const folderList = document.getElementById('folderList');
+    const fileSearchInput = document.getElementById('fileSearchInput');
+    const fileList = document.getElementById('fileList');
+    const loading = document.getElementById('loading');
+    const extrinsicInput = document.getElementById('extrinsicInput');
+    const applyExtrinsicBtn = document.getElementById('applyExtrinsicBtn');
+    const resetExtrinsicBtn = document.getElementById('resetExtrinsicBtn');
+    const extrinsicStatus = document.getElementById('extrinsicStatus');
+
+    let scene, camera, renderer, controls;
+    let currentMesh = null;
+    let currentSplat = null;
+    let currentFolder = '';
+    let currentFolderFiles = [];
+    let currentFileName = '';
+    let initialExtrinsicW2C = null;
+    let extrinsicEditPending = false;
+
+    const keyState = {
+      ArrowUp: false,
+      ArrowDown: false,
+      ArrowLeft: false,
+      ArrowRight: false,
+      KeyW: false,
+      KeyA: false,
+      KeyS: false,
+      KeyD: false,
+    };
+
+    const cvToThree = new THREE.Matrix4().set(
+      1, 0, 0, 0,
+      0, -1, 0, 0,
+      0, 0, -1, 0,
+      0, 0, 0, 1,
+    );
+
+    function formatMatrixValue3(v) {
+      const epsilon = 5e-4;
+      const stable = Math.abs(v) < epsilon ? 0 : v;
+      return stable.toFixed(3);
+    }
+
+    function matrixToPrettyText(m) {
+      const e = m.elements;
+      const rows = [];
+      for (let r = 0; r < 4; r++) {
+        const row = [];
+        for (let c = 0; c < 4; c++) {
+          row.push(formatMatrixValue3(e[c * 4 + r]));
+        }
+        rows.push(row.join(' '));
+      }
+      return rows.join('\n');
+    }
+
+    function parseMatrixText(text) {
+      const nums = text.trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+      if (nums.length !== 16) {
+        throw new Error('Need exactly 16 numeric values (4x4).');
+      }
+
+      return new THREE.Matrix4().set(
+        nums[0], nums[1], nums[2], nums[3],
+        nums[4], nums[5], nums[6], nums[7],
+        nums[8], nums[9], nums[10], nums[11],
+        nums[12], nums[13], nums[14], nums[15],
+      );
+    }
+
+    function parseNamed4x4Block(text, blockName) {
+      const escaped = blockName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`${escaped}:\\s*\\n([^\\n]+)\\n([^\\n]+)\\n([^\\n]+)\\n([^\\n]+)`, 'i');
+      const match = text.match(re);
+      if (!match) {
+        return null;
+      }
+
+      const raw = [match[1], match[2], match[3], match[4]].join('\n');
+      try {
+        return parseMatrixText(raw);
+      } catch (error) {
+        return null;
+      }
+    }
+
+    function getDefaultMainViewTxtNames(filename) {
+      const stem = filename.replace(/\.(ply|glb)$/i, '');
+      const prefix = stem
+        .replace(/_mesh_multi$/i, '')
+        .replace(/_mesh$/i, '');
+      const firstToken = (prefix.split('_')[0] || prefix).trim();
+      const candidates = [
+        `${prefix}_camera_main_view.txt`,
+      ];
+
+      if (firstToken && firstToken !== prefix) {
+        candidates.push(`${firstToken}_camera_main_view.txt`);
+      }
+
+      return candidates;
+    }
+
+    async function tryApplyDefaultCameraFromText(folder, filename) {
+      const txtNames = getDefaultMainViewTxtNames(filename);
+
+      try {
+        for (const txtName of txtNames) {
+          const txtUrl = `/output/${encodeURIComponent(folder)}/${encodeURIComponent(txtName)}`;
+          const response = await fetch(txtUrl, { cache: 'no-store' });
+          if (!response.ok) {
+            continue;
+          }
+
+          const content = await response.text();
+          let w2cCv = parseNamed4x4Block(content, 'extrinsic_world_to_camera_4x4');
+
+          if (!w2cCv) {
+            const c2wCv = parseNamed4x4Block(content, 'extrinsic_camera_to_world_4x4');
+            if (c2wCv) {
+              w2cCv = c2wCv.clone().invert();
+            }
+          }
+
+          if (!w2cCv) {
+            continue;
+          }
+
+          setCameraFromExtrinsicOpenCV(w2cCv);
+          syncExtrinsicTextFromCamera();
+          extrinsicStatus.style.color = '#7ddc8b';
+          extrinsicStatus.textContent = `Loaded default camera from ${txtName}.`;
+          return true;
+        }
+
+        return false;
+      } catch (error) {
+        return false;
+      }
+    }
+
+    function getExtrinsicOpenCVFromCamera() {
+      camera.updateMatrixWorld(true);
+      const w2cThree = camera.matrixWorld.clone().invert();
+      return cvToThree.clone().multiply(w2cThree).multiply(cvToThree);
+    }
+
+    function setCameraFromExtrinsicOpenCV(w2cCv) {
+      const w2cThree = cvToThree.clone().multiply(w2cCv).multiply(cvToThree);
+      const c2wThree = w2cThree.clone().invert();
+      c2wThree.decompose(camera.position, camera.quaternion, camera.scale);
+
+      const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+      controls.target.copy(camera.position).add(forward);
+      controls.update();
+    }
+
+    function syncExtrinsicTextFromCamera() {
+      if (document.activeElement === extrinsicInput || extrinsicEditPending) {
+        return;
+      }
+      const w2cCv = getExtrinsicOpenCVFromCamera();
+      extrinsicInput.value = matrixToPrettyText(w2cCv);
+    }
+
+    function isTypingElement(el) {
+      if (!el) {
+        return false;
+      }
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    }
+
+    function applyKeyboardMove(dtSec) {
+      const move = new THREE.Vector3();
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+      const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
+
+      if (keyState.ArrowLeft || keyState.KeyA) move.addScaledVector(right, -1);
+      if (keyState.ArrowRight || keyState.KeyD) move.addScaledVector(right, 1);
+      if (keyState.ArrowUp || keyState.KeyW) move.addScaledVector(camUp, 1);
+      if (keyState.ArrowDown || keyState.KeyS) move.addScaledVector(camUp, -1);
+
+      if (move.lengthSq() === 0) {
+        return;
+      }
+
+      const orbitDist = camera.position.distanceTo(controls.target);
+      const speed = Math.max(0.05, orbitDist * 1.2);
+      move.normalize().multiplyScalar(speed * dtSec);
+
+      camera.position.add(move);
+      controls.target.add(move);
+    }
+
+    // Initialize Three.js scene
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(75, container.clientWidth / container.clientHeight, 0.1, 1000);
+      // Identity-style default camera pose (like create_mesh camera frame).
+      camera.position.set(0, 0, 0);
+      camera.quaternion.set(0, 0, 0, 1);
+      // Previous default camera:
+      // camera.position.z = 2;
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(window.devicePixelRatio);
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.NoToneMapping;
+      container.appendChild(renderer.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enableDamping = true;
+      controls.dampingFactor = 0.05;
+      // Match identity-extrinsic renderer convention after OpenCV->Three.js axis mapping.
+      controls.target.set(0, 0, -1);
+
+      const clock = new THREE.Clock();
+
+      // Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      scene.add(ambientLight);
+      const directionalLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      directionalLight.position.set(0, 0, 1);
+      camera.add(directionalLight);
+      scene.add(camera);
+
+      // Animation loop
+      function animate() {
+        requestAnimationFrame(animate);
+        const dt = clock.getDelta();
+        applyKeyboardMove(dt);
+        controls.update();
+        syncExtrinsicTextFromCamera();
+        renderer.render(scene, camera);
+      }
+      animate();
+
+      syncExtrinsicTextFromCamera();
+
+      // Handle window resize
+      window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+      });
+    }
+
+    // Load available folders
+    async function loadFolders() {
+      try {
+        const response = await fetch('/api/folders');
+        const data = await response.json();
+        
+        folderList.innerHTML = '';
+        data.folders.forEach(folder => {
+          const div = document.createElement('div');
+          div.className = 'folder-item';
+          div.textContent = folder;
+          div.onclick = () => loadFolder(folder);
+          folderList.appendChild(div);
+        });
+      } catch (error) {
+        console.error('Failed to load folders:', error);
+      }
+    }
+
+    // Load files from a specific folder
+    async function loadFolder(folder) {
+      currentFolder = folder;
+      folderInput.value = folder;
+      
+      // Update active state
+      document.querySelectorAll('.folder-item').forEach(el => {
+        el.classList.toggle('active', el.textContent === folder);
+      });
+
+      try {
+        const response = await fetch(`/api/files/${encodeURIComponent(folder)}`);
+        const data = await response.json();
+
+        currentFolderFiles = Array.isArray(data.files) ? data.files : [];
+        currentFileName = '';
+        renderFileList();
+      } catch (error) {
+        console.error('Failed to load files:', error);
+        currentFolderFiles = [];
+        currentFileName = '';
+        fileList.innerHTML = '<div style="padding:10px;color:#f44;">Error loading files</div>';
+      }
+    }
+
+    function renderFileList() {
+      const query = fileSearchInput.value.trim().toLowerCase();
+      const filteredFiles = currentFolderFiles.filter((file) => file.name.toLowerCase().includes(query));
+
+      fileList.innerHTML = '';
+
+      if (currentFolderFiles.length === 0) {
+        fileList.innerHTML = '<div style="padding:10px;color:#888;">No files found</div>';
+        return;
+      }
+
+      if (filteredFiles.length === 0) {
+        fileList.innerHTML = '<div style="padding:10px;color:#888;">No files match filter</div>';
+        return;
+      }
+
+      filteredFiles.forEach((file) => {
+        const div = document.createElement('div');
+        div.className = 'file-item';
+        if (file.name === currentFileName) {
+          div.classList.add('active');
+        }
+
+        const nameSpan = document.createElement('span');
+        nameSpan.textContent = file.name;
+        div.appendChild(nameSpan);
+
+        const typeSpan = document.createElement('span');
+        typeSpan.className = `file-type ${file.type}`;
+        typeSpan.textContent = file.type.toUpperCase();
+        div.appendChild(typeSpan);
+
+        div.onclick = () => loadFile(currentFolder, file.name, file.type);
+        fileList.appendChild(div);
+      });
+    }
+
+    // Clear current visualization
+    function clearScene() {
+      if (currentMesh) {
+        scene.remove(currentMesh);
+        if (currentMesh.geometry) currentMesh.geometry.dispose();
+        if (currentMesh.material) {
+          if (Array.isArray(currentMesh.material)) {
+            currentMesh.material.forEach(m => m.dispose());
+          } else {
+            currentMesh.material.dispose();
+          }
+        }
+        currentMesh = null;
+      }
+      
+      if (currentSplat) {
+        scene.remove(currentSplat);
+        currentSplat = null;
+      }
+    }
+
+    // Load and visualize a file
+    async function loadFile(folder, filename, type) {
+      loading.style.display = 'block';
+      clearScene();
+
+      currentFileName = filename;
+      renderFileList();
+
+      const usedDefaultCamera = await tryApplyDefaultCameraFromText(folder, filename);
+      if (!usedDefaultCamera) {
+        extrinsicStatus.style.color = '#aaa';
+        extrinsicStatus.textContent = 'No default camera text found; using current camera pose.';
+      }
+      initialExtrinsicW2C = getExtrinsicOpenCVFromCamera().clone();
+
+      const url = `/output/${folder}/${filename}`;
+
+      try {
+        if (type === 'gs') {
+          // Load Gaussian Splat
+          currentSplat = new SplatMesh({ url });
+          currentSplat.quaternion.set(1, 0, 0, 0);
+          currentSplat.position.set(0, 0, 0);
+          scene.add(currentSplat);
+          loading.style.display = 'none';
+        } else if (filename.toLowerCase().endsWith('.glb')) {
+          // Load GLTF / GLB mesh
+          const loader = new GLTFLoader();
+          loader.load(url, function (gltf) {
+            const model = gltf.scene;
+            
+            // Traverse and ensure the materials are visible and unlit
+            model.traverse((child) => {
+              if (child.isMesh && child.material) {
+                const materials = Array.isArray(child.material) ? child.material : [child.material];
+                
+                const basicMaterials = materials.map(mat => {
+                  const basicMat = new THREE.MeshBasicMaterial({
+                    map: mat.map || null,
+                    color: mat.color || 0xffffff,
+                    side: THREE.DoubleSide
+                  });
+                  
+                  // Make sure the texture maps to the correct output encoding
+                  if (basicMat.map) {
+                    basicMat.map.colorSpace = THREE.SRGBColorSpace;
+                  }
+                  
+                  // Dispose underlying standard material to free memory
+                  mat.dispose();
+                  return basicMat;
+                });
+
+                child.material = Array.isArray(child.material) ? basicMaterials : basicMaterials[0];
+              }
+            });
+            
+            // Apply the same coordinate identity corrections if needed
+            model.quaternion.set(1, 0, 0, 0);
+            model.position.set(0, 0, 0);
+            
+            scene.add(model);
+            currentMesh = model;
+            loading.style.display = 'none';
+          }, undefined, function(error) {
+            console.error('Failed to load GLB: ', error);
+            alert('Failed to load GLB: ' + error.message);
+            loading.style.display = 'none';
+          });
+        } else {
+          // Load PLY mesh
+          const loader = new PLYLoader();
+          loader.load(url, function (geometry) {
+            geometry.computeVertexNormals();
+
+            const colorAttr = geometry.getAttribute('color');
+            const hasVertexColors = !!colorAttr;
+
+            // Some PLY exporters store vertex colors as 0..255 floats instead of 0..1.
+            if (hasVertexColors && colorAttr.count > 0) {
+              let maxColor = 0;
+              for (let i = 0; i < colorAttr.array.length; i++) {
+                if (colorAttr.array[i] > maxColor) {
+                  maxColor = colorAttr.array[i];
+                }
+              }
+              if (maxColor > 1.0) {
+                for (let i = 0; i < colorAttr.array.length; i++) {
+                  colorAttr.array[i] /= 255.0;
+                }
+                colorAttr.needsUpdate = true;
+              }
+            }
+
+            const material = hasVertexColors
+              ? new THREE.MeshBasicMaterial({
+                  vertexColors: true,
+                  side: THREE.DoubleSide,
+                })
+              : new THREE.MeshStandardMaterial({
+                  color: 0xdddddd,
+                  metalness: 0.0,
+                  roughness: 1.0,
+                  side: THREE.DoubleSide,
+                });
+            const mesh = new THREE.Mesh(geometry, material);
+            mesh.quaternion.set(1, 0, 0, 0);
+            mesh.position.set(0, 0, 0);
+            scene.add(mesh);
+            currentMesh = mesh;
+            loading.style.display = 'none';
+          }, undefined, function(error) {
+            console.error('Failed to load PLY: ', error);
+            alert('Failed to load PLY: ' + error.message);
+            loading.style.display = 'none';
+          });
+        }
+      } catch (error) {
+        console.error('Failed to init loading:', error);
+        alert('Failed to init loading: ' + error.message);
+        loading.style.display = 'none';
+      }
+    }
+
+    // Event listeners
+    loadFolderBtn.onclick = () => {
+      const folder = folderInput.value.trim();
+      if (folder) {
+        loadFolder(folder);
+      }
+    };
+
+    folderInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        loadFolderBtn.click();
+      }
+    });
+
+    fileSearchInput.addEventListener('input', () => {
+      renderFileList();
+    });
+
+    extrinsicInput.addEventListener('input', () => {
+      extrinsicEditPending = true;
+    });
+
+    applyExtrinsicBtn.onclick = () => {
+      try {
+        const w2cCv = parseMatrixText(extrinsicInput.value);
+        setCameraFromExtrinsicOpenCV(w2cCv);
+        extrinsicEditPending = false;
+        syncExtrinsicTextFromCamera();
+        extrinsicStatus.style.color = '#7ddc8b';
+        extrinsicStatus.textContent = 'Extrinsic applied.';
+      } catch (error) {
+        extrinsicStatus.style.color = '#ff8a8a';
+        extrinsicStatus.textContent = `Invalid matrix: ${error.message}`;
+      }
+    };
+
+    resetExtrinsicBtn.onclick = () => {
+      if (!initialExtrinsicW2C) {
+        extrinsicStatus.style.color = '#ff8a8a';
+        extrinsicStatus.textContent = 'No initial extrinsic is available yet.';
+        return;
+      }
+
+      setCameraFromExtrinsicOpenCV(initialExtrinsicW2C);
+      extrinsicEditPending = false;
+      syncExtrinsicTextFromCamera();
+      extrinsicStatus.style.color = '#7ddc8b';
+      extrinsicStatus.textContent = 'Camera reset to initial extrinsic.';
+    };
+
+    window.addEventListener('keydown', (e) => {
+      if (isTypingElement(document.activeElement)) {
+        return;
+      }
+      if (!(e.code in keyState)) {
+        return;
+      }
+      keyState[e.code] = true;
+      e.preventDefault();
+    });
+
+    window.addEventListener('keyup', (e) => {
+      if (!(e.code in keyState)) {
+        return;
+      }
+      keyState[e.code] = false;
+      e.preventDefault();
+    });
+
+    // Initialize
+    initScene();
+    loadFolders();
+
+    // Load folder from URL parameter if present
+    const params = new URLSearchParams(window.location.search);
+    const urlFolder = params.get('folder');
+    if (urlFolder) {
+      loadFolder(urlFolder);
+    }
+  </script>
+</body>
+
+</html>

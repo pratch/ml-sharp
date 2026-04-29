@@ -231,6 +231,7 @@
     let currentMeshFiles = [];
     let currentMeshFile = '';
     let initialExtrinsicW2C = null;
+    let extrinsicEditPending = false;
 
     const keyState = {
       ArrowUp: false,
@@ -319,40 +320,55 @@
       }
     }
 
-    function getDefaultMainViewTxtName(meshFile) {
+    function getDefaultMainViewTxtNames(meshFile) {
       const stem = meshFile.replace(/\.(ply|glb)$/i, '');
-      const prefix = stem.split('_')[0] || stem;
-      return `${prefix}_camera_main_view.txt`;
+      const prefix = stem
+        .replace(/_mesh_multi$/i, '')
+        .replace(/_mesh$/i, '');
+      const firstToken = (prefix.split('_')[0] || prefix).trim();
+      const candidates = [
+        `${prefix}_camera_main_view.txt`,
+      ];
+
+      if (firstToken && firstToken !== prefix) {
+        candidates.push(`${firstToken}_camera_main_view.txt`);
+      }
+
+      return candidates;
     }
 
     async function tryApplyDefaultCameraFromText(folder, meshFile) {
-      const txtName = getDefaultMainViewTxtName(meshFile);
-      const txtURL = `/output/${encodeURIComponent(folder)}/${encodeURIComponent(txtName)}`;
+      const txtNames = getDefaultMainViewTxtNames(meshFile);
 
       try {
-        const response = await fetch(txtURL, { cache: 'no-store' });
-        if (!response.ok) {
-          return false;
-        }
-
-        const content = await response.text();
-        let w2cCv = parseNamed4x4Block(content, 'extrinsic_world_to_camera_4x4');
-
-        if (!w2cCv) {
-          const c2wCv = parseNamed4x4Block(content, 'extrinsic_camera_to_world_4x4');
-          if (c2wCv) {
-            w2cCv = c2wCv.clone().invert();
+        for (const txtName of txtNames) {
+          const txtURL = `/output/${encodeURIComponent(folder)}/${encodeURIComponent(txtName)}`;
+          const response = await fetch(txtURL, { cache: 'no-store' });
+          if (!response.ok) {
+            continue;
           }
+
+          const content = await response.text();
+          let w2cCv = parseNamed4x4Block(content, 'extrinsic_world_to_camera_4x4');
+
+          if (!w2cCv) {
+            const c2wCv = parseNamed4x4Block(content, 'extrinsic_camera_to_world_4x4');
+            if (c2wCv) {
+              w2cCv = c2wCv.clone().invert();
+            }
+          }
+
+          if (!w2cCv) {
+            continue;
+          }
+
+          setCameraFromExtrinsicOpenCV(w2cCv);
+          syncExtrinsicTextFromCamera();
+          setStatus(`Loaded default camera from ${txtName}.`);
+          return true;
         }
 
-        if (!w2cCv) {
-          return false;
-        }
-
-        setCameraFromExtrinsicOpenCV(w2cCv);
-        syncExtrinsicTextFromCamera();
-        setStatus(`Loaded default camera from ${txtName}.`);
-        return true;
+        return false;
       } catch (error) {
         return false;
       }
@@ -375,7 +391,7 @@
     }
 
     function syncExtrinsicTextFromCamera() {
-      if (document.activeElement === extrinsicInput) {
+      if (document.activeElement === extrinsicInput || extrinsicEditPending) {
         return;
       }
       const w2cCv = getExtrinsicOpenCVFromCamera();
@@ -782,10 +798,15 @@
       renderMeshList();
     });
 
+    extrinsicInput.addEventListener('input', () => {
+      extrinsicEditPending = true;
+    });
+
     applyExtrinsicBtn.onclick = () => {
       try {
         const w2cCv = parseMatrixText(extrinsicInput.value);
         setCameraFromExtrinsicOpenCV(w2cCv);
+        extrinsicEditPending = false;
         syncExtrinsicTextFromCamera();
         setStatus('Extrinsic applied.');
       } catch (error) {
@@ -800,6 +821,7 @@
       }
 
       setCameraFromExtrinsicOpenCV(initialExtrinsicW2C);
+      extrinsicEditPending = false;
       syncExtrinsicTextFromCamera();
       setStatus('Camera reset to initial extrinsic.');
     };

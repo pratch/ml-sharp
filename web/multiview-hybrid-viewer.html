@@ -1,0 +1,1236 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Multi-view Hybrid Viewer</title>
+  <style>
+    body {
+      margin: 0;
+      overflow: hidden;
+      display: flex;
+      height: 100vh;
+      font-family: monospace;
+      background: #111;
+      color: #ddd;
+    }
+
+    #sidebar {
+      width: 380px;
+      background: #1a1a1a;
+      padding: 12px;
+      overflow-y: auto;
+      box-sizing: border-box;
+      border-right: 1px solid #333;
+    }
+
+    #container {
+      flex: 3 1 0;
+      min-width: 0;
+      position: relative;
+    }
+
+    #containerSecondary {
+      flex: 2 1 0;
+      min-width: 0;
+      position: relative;
+      border-left: 1px solid #222;
+    }
+
+    #loading {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(0, 0, 0, 0.65);
+      color: #fff;
+      padding: 8px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      display: none;
+      z-index: 10;
+    }
+
+    h2 {
+      margin: 10px 0 6px;
+      font-size: 14px;
+      color: #eee;
+    }
+
+    input[type="text"] {
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #111;
+      color: #ddd;
+      box-sizing: border-box;
+      margin-bottom: 8px;
+    }
+
+    button {
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #222;
+      color: #ddd;
+      cursor: pointer;
+      margin-bottom: 8px;
+    }
+
+    button:hover {
+      background: #2a2a2a;
+    }
+
+    textarea {
+      width: 100%;
+      padding: 8px;
+      border-radius: 6px;
+      border: 1px solid #444;
+      background: #111;
+      color: #ddd;
+      box-sizing: border-box;
+      resize: vertical;
+    }
+
+    .folder-item {
+      padding: 8px;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #111;
+      margin-bottom: 6px;
+      cursor: pointer;
+    }
+
+    .folder-item:hover {
+      background: #181818;
+    }
+
+    .folder-item.active {
+      border-color: #6aa0ff;
+      background: #141d2a;
+    }
+
+    #folderList {
+      max-height: 200px;
+      overflow-y: auto;
+      border: 1px solid #2a2a2a;
+      border-radius: 6px;
+      padding: 6px;
+      margin-bottom: 6px;
+    }
+
+    .cam-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid #333;
+      border-radius: 6px;
+      background: #111;
+      margin-bottom: 6px;
+    }
+
+    .cam-item button {
+      width: auto;
+      padding: 4px 8px;
+      margin: 0 0 0 auto;
+      font-size: 12px;
+    }
+
+    .cam-item label {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    .cam-note {
+      color: #9aa;
+      font-size: 12px;
+      margin-top: 4px;
+      line-height: 1.35;
+    }
+
+    .meta {
+      font-size: 12px;
+      color: #aaa;
+      margin-top: 8px;
+      line-height: 1.35;
+    }
+
+    #status {
+      color: #8fd18f;
+      font-size: 0.86em;
+      margin-top: 8px;
+      min-height: 2.6em;
+      line-height: 1.3;
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.178.0/three.module.js",
+        "@sparkjsdev/spark": "https://sparkjs.dev/releases/spark/0.1.10/spark.module.js",
+        "three/examples/jsm/controls/OrbitControls.js": "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/controls/OrbitControls.min.js"
+      }
+    }
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/stats-js@1.0.1/build/stats.min.js"></script>
+</head>
+
+<body>
+  <div id="sidebar">
+    <h2>Folder</h2>
+    <input type="text" id="folderInput" placeholder="Enter folder name...">
+    <button id="loadFolderBtn">Load Folder</button>
+
+    <h2>Recent Folders</h2>
+    <div id="folderList"></div>
+
+    <h2>Cams</h2>
+    <div class="cam-note">Loads only checked cams (defaults: 4, 9, 12, 17).</div>
+    <div id="camList"></div>
+
+    <h2>Camera Extrinsic (W2C, OpenCV)</h2>
+    <textarea id="extrinsicInput" rows="5" spellcheck="false"></textarea>
+    <button id="applyExtrinsicBtn">Apply Extrinsic</button>
+    <button id="resetExtrinsicBtn">Reset Extrinsic</button>
+
+    <div class="meta" id="metaInfo">
+      Toggle meshes like <code>lego_cam00_mesh_multi.glb</code>; camera text is read from <code>lego_cam00_camera_main_view.txt</code>.
+      The splat options match the original hybrid viewer.
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <div id="container"></div>
+  <div id="containerSecondary"></div>
+  <div id="loading">Loading...</div>
+
+  <script type="module">
+    import * as THREE from "three";
+    import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
+    import { SplatMesh } from "@sparkjsdev/spark";
+    import * as dat from "https://cdn.jsdelivr.net/npm/dat.gui@0.7.9/build/dat.gui.module.js";
+    import { PLYLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/PLYLoader.min.js";
+    import { GLTFLoader } from "https://cdn.jsdelivr.net/npm/three@0.178.0/examples/jsm/loaders/GLTFLoader.min.js";
+
+    const stats = new Stats();
+    stats.showPanel(0);
+    document.body.appendChild(stats.dom);
+
+    const container = document.getElementById('container');
+    const containerSecondary = document.getElementById('containerSecondary');
+    const loading = document.getElementById('loading');
+    const folderInput = document.getElementById('folderInput');
+    const loadFolderBtn = document.getElementById('loadFolderBtn');
+    const folderList = document.getElementById('folderList');
+    const camList = document.getElementById('camList');
+    const extrinsicInput = document.getElementById('extrinsicInput');
+    const applyExtrinsicBtn = document.getElementById('applyExtrinsicBtn');
+    const resetExtrinsicBtn = document.getElementById('resetExtrinsicBtn');
+    const statusEl = document.getElementById('status');
+    let lastDebugStatus = null;
+
+    let scene;
+    let camera;
+    let renderer;
+    let controls;
+    let cameraSecondary;
+    let rendererSecondary;
+
+    let currentSplat = null;
+    let currentPrunedSplat = null;
+
+    let currentFolder = '';
+    let currentMeshFiles = [];
+    let camEntries = [];
+    let cameraVizGroup = null;
+    let lastObjectCenter = null;
+
+    let splatBase = '';
+    let initialExtrinsicW2C = null;
+    let extrinsicEditPending = false;
+
+    const loadedMeshesByCam = new Map();
+
+    const defaultCamsOn = new Set([4, 9, 12, 17]);
+
+    const keyState = {
+      ArrowUp: false,
+      ArrowDown: false,
+      ArrowLeft: false,
+      ArrowRight: false,
+      KeyW: false,
+      KeyA: false,
+      KeyS: false,
+      KeyD: false,
+    };
+
+    const cvToThree = new THREE.Matrix4().set(
+      1, 0, 0, 0,
+      0, -1, 0, 0,
+      0, 0, -1, 0,
+      0, 0, 0, 1,
+    );
+
+    let gui;
+    const guiParams = {
+      cameraMotion: 'None',
+      amplitude: 2,
+      speed: 1,
+      center: 50,
+      showCameraVizMain: false,
+      showMesh: true,
+      showSplat: false,
+      showPrunedSplat: true,
+    };
+
+    let linspace = [];
+    let distance = 1.0;
+    let centerDepth = 2.0;
+
+    let loadingCounter = 0;
+    function showLoading() {
+      loadingCounter++;
+      loading.style.display = 'block';
+    }
+    function hideLoading() {
+      loadingCounter = Math.max(0, loadingCounter - 1);
+      if (loadingCounter === 0) {
+        loading.style.display = 'none';
+      }
+    }
+
+    function setStatus(text, isError = false) {
+      statusEl.style.color = isError ? '#ff8f8f' : '#8fd18f';
+      statusEl.textContent = text;
+    }
+
+    function setDebugStatus(text, isError = false) {
+      lastDebugStatus = { text, isError };
+      setStatus(text, isError);
+    }
+
+    function formatVec3(v) {
+      if (!v) return 'n/a';
+      return `[${v.x.toFixed(3)}, ${v.y.toFixed(3)}, ${v.z.toFixed(3)}]`;
+    }
+
+    function setLayerRecursive(root, layer) {
+      if (!root) return;
+      root.traverse((obj) => {
+        obj.layers.set(layer);
+      });
+    }
+
+    function computeLoadedMeshCenter() {
+      if (!loadedMeshesByCam.size) return null;
+      const box = new THREE.Box3();
+      let initialized = false;
+      loadedMeshesByCam.forEach((mesh) => {
+        if (!mesh) return;
+        const meshBox = new THREE.Box3().setFromObject(mesh);
+        if (!initialized) {
+          box.copy(meshBox);
+          initialized = true;
+        } else {
+          box.union(meshBox);
+        }
+      });
+      if (!initialized) return null;
+      const center = new THREE.Vector3();
+      box.getCenter(center);
+      return center;
+    }
+
+    let snapRequestToken = 0;
+    async function snapToCam(entry) {
+      if (!entry || !currentFolder) return;
+      const token = ++snapRequestToken;
+
+      showLoading();
+      setStatus(`Snapping camera to ${entry.label}...`);
+      try {
+        const ok = await tryApplyDefaultCameraFromText(currentFolder, entry.meshFile);
+        if (token !== snapRequestToken) {
+          return;
+        }
+        if (!ok) {
+          setStatus(`Could not load camera text for ${entry.label}.`, true);
+          return;
+        }
+        setStatus(`Snapped camera to ${entry.label}.`);
+      } finally {
+        hideLoading();
+      }
+    }
+
+    function formatMatrixValue3(v) {
+      const epsilon = 5e-4;
+      const stable = Math.abs(v) < epsilon ? 0 : v;
+      return stable.toFixed(3);
+    }
+
+    function matrixToPrettyText(m) {
+      const e = m.elements;
+      const rows = [];
+      for (let r = 0; r < 4; r++) {
+        const row = [];
+        for (let c = 0; c < 4; c++) {
+          row.push(formatMatrixValue3(e[c * 4 + r]));
+        }
+        rows.push(row.join(' '));
+      }
+      return rows.join('\n');
+    }
+
+    function parseMatrixText(text) {
+      const nums = text.trim().split(/[\s,]+/).map(Number).filter(Number.isFinite);
+      if (nums.length !== 16) {
+        throw new Error('Need exactly 16 numeric values (4x4).');
+      }
+
+      return new THREE.Matrix4().set(
+        nums[0], nums[1], nums[2], nums[3],
+        nums[4], nums[5], nums[6], nums[7],
+        nums[8], nums[9], nums[10], nums[11],
+        nums[12], nums[13], nums[14], nums[15],
+      );
+    }
+
+    function parseNamed4x4Block(text, blockName) {
+      const escaped = blockName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const re = new RegExp(`${escaped}:\\s*\\n([^\\n]+)\\n([^\\n]+)\\n([^\\n]+)\\n([^\\n]+)`, 'i');
+      const match = text.match(re);
+      if (!match) {
+        return null;
+      }
+
+      const raw = [match[1], match[2], match[3], match[4]].join('\n');
+      try {
+        return parseMatrixText(raw);
+      } catch {
+        return null;
+      }
+    }
+
+    function getDefaultMainViewTxtNames(meshFile) {
+      const stem = meshFile.replace(/\.(ply|glb)$/i, '');
+      const prefix = stem
+        .replace(/_mesh_multi$/i, '')
+        .replace(/_mesh$/i, '');
+      const firstToken = (prefix.split('_')[0] || prefix).trim();
+      const candidates = [`${prefix}_camera_main_view.txt`];
+
+      if (firstToken && firstToken !== prefix) {
+        candidates.push(`${firstToken}_camera_main_view.txt`);
+      }
+
+      return candidates;
+    }
+
+    async function tryApplyDefaultCameraFromText(folder, meshFile) {
+      const txtNames = getDefaultMainViewTxtNames(meshFile);
+
+      try {
+        for (const txtName of txtNames) {
+          const txtURL = `/output/${encodeURIComponent(folder)}/${encodeURIComponent(txtName)}`;
+          const response = await fetch(txtURL, { cache: 'no-store' });
+          if (!response.ok) {
+            continue;
+          }
+
+          const content = await response.text();
+          let w2cCv = parseNamed4x4Block(content, 'extrinsic_world_to_camera_4x4');
+
+          if (!w2cCv) {
+            const c2wCv = parseNamed4x4Block(content, 'extrinsic_camera_to_world_4x4');
+            if (c2wCv) {
+              w2cCv = c2wCv.clone().invert();
+            }
+          }
+
+          if (!w2cCv) {
+            continue;
+          }
+
+          setCameraFromExtrinsicOpenCV(w2cCv);
+          syncExtrinsicTextFromCamera();
+          setStatus(`Loaded default camera from ${txtName}.`);
+          return true;
+        }
+
+        return false;
+      } catch {
+        return false;
+      }
+    }
+
+    function getExtrinsicOpenCVFromCamera() {
+      camera.updateMatrixWorld(true);
+      const w2cThree = camera.matrixWorld.clone().invert();
+      return cvToThree.clone().multiply(w2cThree).multiply(cvToThree);
+    }
+
+    function setCameraFromExtrinsicOpenCV(w2cCv) {
+      const w2cThree = cvToThree.clone().multiply(w2cCv).multiply(cvToThree);
+      const c2wThree = w2cThree.clone().invert();
+      c2wThree.decompose(camera.position, camera.quaternion, camera.scale);
+
+      if (lastObjectCenter) {
+        controls.target.copy(lastObjectCenter);
+      } else {
+        const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(camera.quaternion);
+        controls.target.copy(camera.position).add(forward);
+      }
+      controls.update();
+    }
+
+    function syncExtrinsicTextFromCamera() {
+      if (document.activeElement === extrinsicInput || extrinsicEditPending) {
+        return;
+      }
+      const w2cCv = getExtrinsicOpenCVFromCamera();
+      extrinsicInput.value = matrixToPrettyText(w2cCv);
+    }
+
+    function isTypingElement(el) {
+      if (!el) {
+        return false;
+      }
+      const tag = el.tagName;
+      return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || el.isContentEditable;
+    }
+
+    function applyKeyboardMove(dtSec) {
+      const move = new THREE.Vector3();
+      const forward = new THREE.Vector3();
+      camera.getWorldDirection(forward);
+      const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+      const camUp = new THREE.Vector3(0, 1, 0).applyQuaternion(camera.quaternion).normalize();
+
+      if (keyState.ArrowLeft || keyState.KeyA) move.addScaledVector(right, -1);
+      if (keyState.ArrowRight || keyState.KeyD) move.addScaledVector(right, 1);
+      if (keyState.ArrowUp || keyState.KeyW) move.addScaledVector(camUp, 1);
+      if (keyState.ArrowDown || keyState.KeyS) move.addScaledVector(camUp, -1);
+
+      if (move.lengthSq() === 0) {
+        return;
+      }
+
+      const orbitDist = camera.position.distanceTo(controls.target);
+      const speed = Math.max(0.05, orbitDist * 1.2);
+      move.normalize().multiplyScalar(speed * dtSec);
+
+      camera.position.add(move);
+      controls.target.add(move);
+    }
+
+    function initScene() {
+      scene = new THREE.Scene();
+      camera = new THREE.PerspectiveCamera(54.88, container.clientWidth / container.clientHeight, 0.1, 1000);
+      camera.position.set(0, 0, 0);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+      renderer.toneMapping = THREE.NoToneMapping;
+      renderer.setSize(container.clientWidth, container.clientHeight);
+      container.appendChild(renderer.domElement);
+
+      cameraSecondary = new THREE.PerspectiveCamera(54.88, containerSecondary.clientWidth / containerSecondary.clientHeight, 0.1, 1000);
+      cameraSecondary.layers.set(1);
+
+      rendererSecondary = new THREE.WebGLRenderer({ antialias: true });
+      rendererSecondary.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+      rendererSecondary.outputColorSpace = THREE.SRGBColorSpace;
+      rendererSecondary.toneMapping = THREE.NoToneMapping;
+      rendererSecondary.setSize(containerSecondary.clientWidth, containerSecondary.clientHeight);
+      containerSecondary.appendChild(rendererSecondary.domElement);
+
+      controls = new OrbitControls(camera, renderer.domElement);
+      controls.enablePan = false;
+      controls.target.set(0, 0, -2);
+      controls.update();
+
+      const clock = new THREE.Clock();
+
+      const ambient = new THREE.AmbientLight(0xffffff, 1.0);
+      scene.add(ambient);
+
+      cameraVizGroup = new THREE.Group();
+      cameraVizGroup.layers.set(1);
+      scene.add(cameraVizGroup);
+
+      gui = new dat.GUI();
+      gui.add(guiParams, 'cameraMotion', ['None', 'SpiralXYZ', 'SpiralXY']);
+      gui.add(guiParams, 'amplitude', 0, 10, 0.1);
+      gui.add(guiParams, 'speed', 0.1, 5, 0.1);
+      gui.add(guiParams, 'center', 0, 99, 1).onChange((value) => {
+        if (!linspace.length) return;
+        centerDepth = 1 / linspace[Math.floor(value)];
+        controls.target.set(0, 0, -centerDepth);
+        controls.update();
+      });
+      gui.add(guiParams, 'showCameraVizMain').name('showCamVizMain').onChange((value) => {
+        if (value) {
+          camera.layers.enable(1);
+        } else {
+          camera.layers.disable(1);
+        }
+      });
+      gui.add(guiParams, 'showMesh').onChange((value) => {
+        loadedMeshesByCam.forEach((mesh) => {
+          mesh.visible = value;
+        });
+      });
+      gui.add(guiParams, 'showSplat').onChange((value) => {
+        if (value) {
+          ensureFullSplatLoaded();
+        }
+        if (currentSplat) currentSplat.visible = value;
+      });
+      gui.add(guiParams, 'showPrunedSplat').onChange((value) => {
+        if (value) {
+          ensurePrunedSplatLoaded();
+        }
+        if (currentPrunedSplat) currentPrunedSplat.visible = value;
+      });
+
+      window.addEventListener('keydown', (e) => {
+        const typing = isTypingElement(document.activeElement);
+
+        if (!typing && e.code in keyState) {
+          keyState[e.code] = true;
+          e.preventDefault();
+          return;
+        }
+
+        if (!typing && e.code === 'Space') {
+          if (guiParams.cameraMotion !== 'None') {
+            guiParams.cameraMotion = 'None';
+            gui.updateDisplay();
+          } else {
+            camera.position.set(0, 0, 0);
+            controls.target.set(0, 0, -centerDepth);
+            controls.update();
+          }
+        }
+      });
+
+      window.addEventListener('keyup', (e) => {
+        if (!(e.code in keyState)) {
+          return;
+        }
+        keyState[e.code] = false;
+        e.preventDefault();
+      });
+
+      window.addEventListener('resize', () => {
+        camera.aspect = container.clientWidth / container.clientHeight;
+        camera.updateProjectionMatrix();
+        renderer.setSize(container.clientWidth, container.clientHeight);
+
+        cameraSecondary.aspect = containerSecondary.clientWidth / containerSecondary.clientHeight;
+        cameraSecondary.updateProjectionMatrix();
+        rendererSecondary.setSize(containerSecondary.clientWidth, containerSecondary.clientHeight);
+      });
+
+      renderer.setAnimationLoop((time) => {
+        stats.begin();
+        const dt = clock.getDelta();
+        const amplitude = guiParams.amplitude * 0.005 * distance;
+        const speed = guiParams.speed * 0.001;
+
+        if (guiParams.cameraMotion === 'SpiralXYZ') {
+          camera.position.x = amplitude * Math.sin(time * speed);
+          camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
+          camera.position.z = 2 * amplitude * (Math.sin(0.5 * time * speed) - 1);
+        } else if (guiParams.cameraMotion === 'SpiralXY') {
+          camera.position.x = amplitude * Math.sin(time * speed);
+          camera.position.y = 0.5 * amplitude * Math.sin(2 * time * speed);
+        }
+
+        applyKeyboardMove(dt);
+        controls.update();
+        syncExtrinsicTextFromCamera();
+        renderer.render(scene, camera);
+
+        if (cameraSecondary) {
+          const target = controls.target.clone();
+          const offset = camera.position.clone().sub(target);
+          const dist = Math.max(0.001, offset.length());
+          const farther = offset.normalize().multiplyScalar(dist * 3.85);
+          cameraSecondary.position.copy(target.clone().add(farther));
+          cameraSecondary.quaternion.copy(camera.quaternion);
+          rendererSecondary.render(scene, cameraSecondary);
+        }
+        stats.end();
+      });
+
+      syncExtrinsicTextFromCamera();
+    }
+
+    function disposeObject3D(root) {
+      if (!root) return;
+      root.traverse((obj) => {
+        if (!obj.isMesh) return;
+        if (obj.geometry) obj.geometry.dispose();
+
+        const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+        materials.forEach((mat) => {
+          if (!mat) return;
+          for (const key of Object.keys(mat)) {
+            const value = mat[key];
+            if (value && value.isTexture && typeof value.dispose === 'function') {
+              value.dispose();
+            }
+          }
+          if (typeof mat.dispose === 'function') {
+            mat.dispose();
+          }
+        });
+      });
+    }
+
+    function clearCameraViz() {
+      if (!cameraVizGroup) return;
+
+      while (cameraVizGroup.children.length) {
+        const child = cameraVizGroup.children.pop();
+        if (child) {
+          cameraVizGroup.remove(child);
+          disposeObject3D(child);
+        }
+      }
+    }
+
+    function createTextSprite(text) {
+      const canvas = document.createElement('canvas');
+      const size = 64;
+      canvas.width = size;
+      canvas.height = size;
+      const ctx = canvas.getContext('2d');
+      ctx.fillStyle = 'white';
+      ctx.font = 'Bold 28px Arial';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(String(text), size / 2, size / 2);
+
+      const texture = new THREE.CanvasTexture(canvas);
+      const material = new THREE.SpriteMaterial({ map: texture, depthTest: true });
+      const sprite = new THREE.Sprite(material);
+      sprite.scale.set(0.35, 0.35, 1);
+      return sprite;
+    }
+
+    function normalizeVector3(v, fallback = new THREE.Vector3(0, 0, -1)) {
+      if (!v || v.lengthSq() < 1e-8) return fallback.clone();
+      return v.clone().normalize();
+    }
+
+    function cvPosToThree(pos) {
+      return pos.clone().applyMatrix4(cvToThree);
+    }
+
+    function cvDirToThree(dir) {
+      const m3 = new THREE.Matrix3().setFromMatrix4(cvToThree);
+      return dir.clone().applyMatrix3(m3).normalize();
+    }
+
+    async function loadCameraViz(folder) {
+      if (!cameraVizGroup) return;
+      clearCameraViz();
+
+      if (!folder) return;
+
+      try {
+        const res = await fetch(`/api/cameras/${encodeURIComponent(folder)}`);
+        if (!res.ok) {
+          return;
+        }
+        const data = await res.json();
+        const cameras = Array.isArray(data.cameras) ? data.cameras : [];
+        if (!cameras.length) {
+          return;
+        }
+
+        const positions = cameras.map((cam) => cvPosToThree(new THREE.Vector3(...cam.position)));
+        let center = null;
+        if (Array.isArray(data.object_center) && data.object_center.length === 3) {
+          const rawCenter = new THREE.Vector3(...data.object_center);
+          center = cvPosToThree(rawCenter);
+          lastObjectCenter = center.clone();
+        } else {
+          center = new THREE.Vector3();
+          positions.forEach((p) => center.add(p));
+          center.multiplyScalar(1 / positions.length);
+          lastObjectCenter = null;
+        }
+
+        if (data.object_center) {
+          const src = data.object_center_source || 'unknown';
+          const c = data.object_center;
+          const tc = center;
+          setDebugStatus(`Object center from ${src}: [${c[0].toFixed(3)}, ${c[1].toFixed(3)}, ${c[2].toFixed(3)}] -> three ${formatVec3(tc)}`);
+        } else {
+          setDebugStatus('Object center fallback: camera centroid (PLY not found).', true);
+        }
+
+        const distances = positions.map((p) => p.distanceTo(center)).sort((a, b) => a - b);
+        const radius = distances[Math.floor(distances.length / 2)] || 1.0;
+
+        const sphereGeometry = new THREE.SphereGeometry(radius, 32, 16);
+        const sphereMaterial = new THREE.MeshBasicMaterial({
+          color: 0x4466ff,
+          wireframe: true,
+          transparent: true,
+          opacity: 0.35,
+        });
+        const sphere = new THREE.Mesh(sphereGeometry, sphereMaterial);
+        sphere.position.copy(center);
+        setLayerRecursive(sphere, 1);
+        cameraVizGroup.add(sphere);
+
+        controls.target.copy(center);
+        controls.update();
+
+        const arrowLength = Math.max(0.1, radius * 0.12);
+        const headLength = arrowLength * 0.35;
+        const headWidth = arrowLength * 0.22;
+
+        cameras.forEach((cam) => {
+          const pos = cvPosToThree(new THREE.Vector3(...cam.position));
+          const dir = normalizeVector3(cvDirToThree(new THREE.Vector3(...(cam.forward || []))));
+          const arrow = new THREE.ArrowHelper(dir, pos, arrowLength, 0xff3333, headLength, headWidth);
+          setLayerRecursive(arrow, 1);
+          cameraVizGroup.add(arrow);
+
+          const label = createTextSprite(cam.id ?? cam.camIndex ?? '?');
+          const labelPos = pos.clone().add(dir.clone().multiplyScalar(arrowLength * 1.1));
+          label.position.copy(labelPos);
+          setLayerRecursive(label, 1);
+          cameraVizGroup.add(label);
+        });
+      } catch {
+        // Camera viz is optional; ignore errors.
+      }
+    }
+
+    function clearCurrent() {
+      loadedMeshesByCam.forEach((mesh) => {
+        scene.remove(mesh);
+        disposeObject3D(mesh);
+      });
+      loadedMeshesByCam.clear();
+
+      clearCameraViz();
+
+      if (currentSplat) {
+        scene.remove(currentSplat);
+        currentSplat = null;
+      }
+
+      if (currentPrunedSplat) {
+        scene.remove(currentPrunedSplat);
+        currentPrunedSplat = null;
+      }
+
+      splatBase = '';
+    }
+
+    function buildLinspace(meta) {
+      const minDepth = meta.min_depth ?? 0.5;
+      const maxDepth = meta.max_depth ?? 4.0;
+      linspace = [];
+      const numPoints = 100;
+      for (let i = 0; i < numPoints; i++) {
+        const t = i / (numPoints - 1);
+        const inv = (1 - t) / minDepth + t / maxDepth;
+        linspace.push(inv);
+      }
+      centerDepth = 1 / linspace[50];
+      distance = Math.max(0.01, maxDepth - minDepth);
+      if (!lastObjectCenter) {
+        controls.target.set(0, 0, -centerDepth);
+        controls.update();
+      }
+    }
+
+    function getCamIndex(meshName) {
+      const match = meshName.match(/cam(\d+)/i);
+      if (!match) return null;
+      const idx = Number.parseInt(match[1], 10);
+      return Number.isFinite(idx) ? idx : null;
+    }
+
+    function inferSplatBaseFromMeshFile(meshName) {
+      const stem = meshName.replace(/\.(ply|glb)$/i, '');
+      const match = stem.match(/^(.*)_cam\d+/i);
+      if (match && match[1]) return match[1];
+      return (stem.split('_')[0] || stem).trim();
+    }
+
+    function buildCamEntries(meshFiles) {
+      const byCam = new Map();
+
+      for (const file of meshFiles) {
+        const lower = file.toLowerCase();
+        const isMesh = lower.endsWith('.glb') || lower.endsWith('.ply');
+        if (!isMesh) continue;
+
+        const camIndex = getCamIndex(file);
+        if (camIndex === null) continue;
+
+        if (byCam.has(camIndex)) continue; // keep newest per /api/meshes sorting
+
+        const label = `cam${String(camIndex).padStart(2, '0')}`;
+        byCam.set(camIndex, { camIndex, label, meshFile: file });
+      }
+
+      return Array.from(byCam.values()).sort((a, b) => a.camIndex - b.camIndex);
+    }
+
+    function renderCamList() {
+      camList.innerHTML = '';
+
+      if (!camEntries.length) {
+        camList.innerHTML = '<div style="padding:10px;color:#888;">No cam meshes found (expected filenames with camXX)</div>';
+        return;
+      }
+
+      camEntries.forEach((entry) => {
+        const row = document.createElement('div');
+        row.className = 'cam-item';
+
+        const checkbox = document.createElement('input');
+        checkbox.type = 'checkbox';
+        checkbox.id = `cam_${entry.camIndex}`;
+        checkbox.checked = defaultCamsOn.has(entry.camIndex);
+        checkbox.addEventListener('change', async () => {
+          await setCamEnabled(entry.camIndex, checkbox.checked);
+        });
+
+        const label = document.createElement('label');
+        label.htmlFor = checkbox.id;
+        label.textContent = `${entry.label} — ${entry.meshFile}`;
+
+        const snapBtn = document.createElement('button');
+        snapBtn.type = 'button';
+        snapBtn.textContent = 'Snap';
+        snapBtn.addEventListener('click', async (ev) => {
+          ev.stopPropagation();
+          await snapToCam(entry);
+        });
+
+        row.appendChild(checkbox);
+        row.appendChild(label);
+        row.appendChild(snapBtn);
+        camList.appendChild(row);
+      });
+    }
+
+    function ensureFullSplatLoaded() {
+      if (!currentFolder || !splatBase || currentSplat) return;
+
+      const splatURL = `/splats/${encodeURIComponent(splatBase)}.ply`;
+      try {
+        currentSplat = new SplatMesh({ url: splatURL });
+        currentSplat.quaternion.set(1, 0, 0, 0);
+        currentSplat.position.set(0, 0, 0);
+        currentSplat.visible = guiParams.showSplat;
+        scene.add(currentSplat);
+      } catch {
+        setStatus(`Could not load GS at ${splatURL}`, true);
+      }
+    }
+
+    function ensurePrunedSplatLoaded() {
+      if (!currentFolder || !splatBase || currentPrunedSplat) return;
+
+      const prunedSplatURL = `/output/${encodeURIComponent(currentFolder)}/${encodeURIComponent(splatBase)}_visible_splats.ply`;
+      try {
+        currentPrunedSplat = new SplatMesh({ url: prunedSplatURL });
+        currentPrunedSplat.quaternion.set(1, 0, 0, 0);
+        currentPrunedSplat.position.set(0, 0, 0);
+        currentPrunedSplat.visible = guiParams.showPrunedSplat;
+        scene.add(currentPrunedSplat);
+      } catch {
+        setStatus(`Could not load pruned GS at ${prunedSplatURL}`, true);
+      }
+    }
+
+    async function loadMetaIfPresent() {
+      if (!currentFolder || !splatBase) return;
+
+      const metaURL = `/output/${encodeURIComponent(currentFolder)}/${encodeURIComponent(splatBase)}.json`;
+      try {
+        const metaRes = await fetch(metaURL);
+        if (!metaRes.ok) {
+          return;
+        }
+        const meta = await metaRes.json();
+        if (meta.vertical_fov_degrees) {
+          camera.fov = meta.vertical_fov_degrees;
+          camera.updateProjectionMatrix();
+        }
+        buildLinspace(meta);
+      } catch {
+        // Optional metadata only.
+      }
+    }
+
+    function getEntry(camIndex) {
+      return camEntries.find((e) => e.camIndex === camIndex) || null;
+    }
+
+    async function setCamEnabled(camIndex, enabled) {
+      if (!currentFolder) return;
+
+      if (enabled) {
+        const entry = getEntry(camIndex);
+        if (!entry) return;
+        await ensureCamMeshLoaded(entry);
+      } else {
+        const mesh = loadedMeshesByCam.get(camIndex);
+        if (!mesh) return;
+        scene.remove(mesh);
+        disposeObject3D(mesh);
+        loadedMeshesByCam.delete(camIndex);
+      }
+    }
+
+    async function ensureCamMeshLoaded(entry) {
+      if (loadedMeshesByCam.has(entry.camIndex)) {
+        return;
+      }
+
+      showLoading();
+      const meshURL = `/output/${encodeURIComponent(currentFolder)}/${encodeURIComponent(entry.meshFile)}`;
+
+      await new Promise((resolve) => {
+        const isGLB = entry.meshFile.toLowerCase().endsWith('.glb');
+
+        if (isGLB) {
+          const loader = new GLTFLoader();
+          loader.load(
+            meshURL,
+            (gltf) => {
+              const mesh = gltf.scene;
+              mesh.traverse((child) => {
+                if (child.isMesh && child.material) {
+                  const map = child.material.map || null;
+                  const newMat = new THREE.MeshBasicMaterial({
+                    map: map,
+                    color: 0xffffff,
+                    side: THREE.DoubleSide,
+                  });
+                  if (typeof child.material.dispose === 'function') {
+                    child.material.dispose();
+                  }
+                  child.material = newMat;
+                }
+              });
+              mesh.quaternion.set(1, 0, 0, 0);
+              mesh.position.set(0, 0, 0);
+              mesh.visible = guiParams.showMesh;
+              scene.add(mesh);
+              loadedMeshesByCam.set(entry.camIndex, mesh);
+              resolve();
+            },
+            undefined,
+            () => {
+              setStatus(`Could not load mesh at ${meshURL}`, true);
+              resolve();
+            }
+          );
+        } else {
+          const loader = new PLYLoader();
+          loader.load(
+            meshURL,
+            (geometry) => {
+              geometry.computeVertexNormals();
+
+              const colorAttr = geometry.getAttribute('color');
+              const hasVertexColors = !!colorAttr;
+              if (hasVertexColors && colorAttr.count > 0) {
+                let maxColor = 0;
+                for (let i = 0; i < colorAttr.array.length; i++) {
+                  if (colorAttr.array[i] > maxColor) maxColor = colorAttr.array[i];
+                }
+                if (maxColor > 1.0) {
+                  for (let i = 0; i < colorAttr.array.length; i++) {
+                    colorAttr.array[i] /= 255.0;
+                  }
+                  colorAttr.needsUpdate = true;
+                }
+              }
+
+              const material = hasVertexColors
+                ? new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide })
+                : new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.0, roughness: 1.0, side: THREE.DoubleSide });
+
+              const mesh = new THREE.Mesh(geometry, material);
+              mesh.quaternion.set(1, 0, 0, 0);
+              mesh.position.set(0, 0, 0);
+              mesh.visible = guiParams.showMesh;
+              scene.add(mesh);
+              loadedMeshesByCam.set(entry.camIndex, mesh);
+              resolve();
+            },
+            undefined,
+            () => {
+              setStatus(`Could not load mesh at ${meshURL}`, true);
+              resolve();
+            }
+          );
+        }
+      });
+
+      hideLoading();
+    }
+
+    async function loadFolders() {
+      try {
+        const res = await fetch('/api/folders');
+        const data = await res.json();
+        folderList.innerHTML = '';
+
+        (data.folders || []).forEach((folder) => {
+          const div = document.createElement('div');
+          div.className = 'folder-item';
+          div.textContent = folder;
+          div.onclick = () => loadFolder(folder);
+          folderList.appendChild(div);
+        });
+      } catch {
+        setStatus('Failed to load folders.', true);
+      }
+    }
+
+    async function loadFolder(folder) {
+      folder = String(folder || '').trim().replace(/^\/?output\//i, '');
+      currentFolder = folder;
+      folderInput.value = folder;
+      setStatus('Loading folder...');
+
+      document.querySelectorAll('.folder-item').forEach((el) => {
+        el.classList.toggle('active', el.textContent === folder);
+      });
+
+      clearCurrent();
+
+      try {
+        const res = await fetch(`/api/meshes/${encodeURIComponent(folder)}`);
+        const data = await res.json();
+
+        currentMeshFiles = data.meshes || [];
+        camEntries = buildCamEntries(currentMeshFiles);
+        renderCamList();
+
+        if (!camEntries.length) {
+          setStatus('No cam meshes found in selected folder.', true);
+          return;
+        }
+
+        splatBase = inferSplatBaseFromMeshFile(camEntries[0].meshFile);
+        await loadMetaIfPresent();
+        await loadCameraViz(folder);
+
+        if (guiParams.showPrunedSplat) {
+          ensurePrunedSplatLoaded();
+        }
+        if (guiParams.showSplat) {
+          ensureFullSplatLoaded();
+        }
+
+        const entryCam4 = getEntry(4);
+        if (entryCam4) {
+          const usedDefaultCamera = await tryApplyDefaultCameraFromText(folder, entryCam4.meshFile);
+          if (!usedDefaultCamera) {
+            setStatus('Could not load cam04 camera text; using current camera pose.');
+          }
+        } else {
+          setStatus('cam04 mesh not found; using current camera pose.');
+        }
+        initialExtrinsicW2C = getExtrinsicOpenCVFromCamera().clone();
+
+        // Only load checked cams (defaults to 4,9,12,17).
+        const checked = Array.from(camList.querySelectorAll('input[type="checkbox"]')).filter((c) => c.checked);
+        for (const cb of checked) {
+          const camIndex = Number.parseInt(cb.id.replace('cam_', ''), 10);
+          const entry = getEntry(camIndex);
+          if (entry) {
+            await ensureCamMeshLoaded(entry);
+          }
+        }
+
+        const loadedMsg = `Loaded folder ${folder}. Showing ${checked.length} cam mesh(es).`;
+        const meshCenter = computeLoadedMeshCenter();
+        const diffMsg = (lastObjectCenter && meshCenter)
+          ? `mesh_center ${formatVec3(meshCenter)}, delta ${formatVec3(meshCenter.clone().sub(lastObjectCenter))}`
+          : 'mesh_center n/a';
+        if (lastDebugStatus) {
+          setStatus(`${lastDebugStatus.text} | ${loadedMsg} | ${diffMsg}`, lastDebugStatus.isError);
+        } else {
+          setStatus(`${loadedMsg} | ${diffMsg}`);
+        }
+      } catch {
+        currentMeshFiles = [];
+        camEntries = [];
+        camList.innerHTML = '<div style="padding:10px;color:#f44;">Error loading cam list</div>';
+        setStatus('Failed to load mesh list.', true);
+      }
+    }
+
+    loadFolderBtn.onclick = () => {
+      const folder = folderInput.value.trim();
+      if (folder) loadFolder(folder);
+    };
+
+    folderInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') loadFolderBtn.click();
+    });
+
+    extrinsicInput.addEventListener('input', () => {
+      extrinsicEditPending = true;
+    });
+
+    applyExtrinsicBtn.onclick = () => {
+      try {
+        const w2cCv = parseMatrixText(extrinsicInput.value);
+        setCameraFromExtrinsicOpenCV(w2cCv);
+        extrinsicEditPending = false;
+        syncExtrinsicTextFromCamera();
+        setStatus('Extrinsic applied.');
+      } catch (error) {
+        setStatus(`Invalid matrix: ${error.message}`, true);
+      }
+    };
+
+    resetExtrinsicBtn.onclick = () => {
+      if (!initialExtrinsicW2C) {
+        setStatus('No initial extrinsic is available yet.', true);
+        return;
+      }
+
+      setCameraFromExtrinsicOpenCV(initialExtrinsicW2C);
+      extrinsicEditPending = false;
+      syncExtrinsicTextFromCamera();
+      setStatus('Camera reset to initial extrinsic.');
+    };
+
+    initScene();
+    loadFolders();
+
+    const params = new URLSearchParams(window.location.search);
+    const qFolder = params.get('folder');
+    if (qFolder) {
+      loadFolder(qFolder);
+    }
+  </script>
+</body>
+
+</html>
